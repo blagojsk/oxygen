@@ -3,6 +3,7 @@
 pub mod boot;
 pub mod exceptions;
 pub mod gic;
+pub mod mmu;
 pub mod semihosting;
 pub mod timer;
 pub mod uart;
