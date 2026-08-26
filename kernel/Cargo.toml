@@ -1,0 +1,17 @@
+[package]
+name = "oxygen-kernel"
+description = "The Oxygen microkernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+
+# There is no `test` crate on a freestanding target, so the default test and bench harnesses
+# cannot link. Disabling them keeps `--all-targets` usable for lints instead of erroring out;
+# host-side unit tests live behind #[cfg(test)] in crates that can run on the host.
+[[bin]]
+name = "oxygen-kernel"
+path = "src/main.rs"
+test = false
+bench = false

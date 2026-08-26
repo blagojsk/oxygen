@@ -1,0 +1,18 @@
+[workspace]
+resolver = "3"
+members = ["kernel"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+# The kernel runs with no allocator and no unwinder, so a panic can only ever abort.
+# Setting it here means `cargo test`-style profiles cannot silently reintroduce unwinding.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1

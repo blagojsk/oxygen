@@ -1,0 +1,19 @@
+# Default to the freestanding aarch64 target so a bare `cargo build` cannot accidentally
+# produce a host binary that links against macOS libc and appears to succeed.
+[build]
+target = "aarch64-unknown-none-softfloat"
+
+# `cargo run` boots the kernel under QEMU. -machine virt is a clean, legacy-free board;
+# -nographic routes the PL011 UART to this terminal; -semihosting lets the kernel ask
+# QEMU to exit with a status code, which is what makes automated boot tests possible.
+[target.aarch64-unknown-none-softfloat]
+runner = """
+qemu-system-aarch64
+  -machine virt
+  -cpu cortex-a72
+  -smp 1
+  -m 256M
+  -nographic
+  -semihosting-config enable=on,target=native
+  -kernel
+"""
