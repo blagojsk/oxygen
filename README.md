@@ -1,6 +1,9 @@
 # Oxygen
 
-An operating system written from scratch in Rust, for agents and humans in equal measure.
+**The Swiss army knife for getting things done in an agentic era.**
+
+An operating system written from scratch in Rust, for agents and humans in equal measure —
+built to make weak and old hardware genuinely useful again.
 
 Conventional systems expose what they can do twice, and badly: as text shaped for people, which
 agents have to scrape and guess at, and as rigid ABIs that nothing can discover at runtime. Oxygen
