@@ -4,6 +4,34 @@ Oxygen is an operating system written from scratch in Rust, built on the premise
 are **agents and people in equal measure**. It is not a Linux distribution, not a wrapper around an
 existing kernel, and not an assistant bolted onto a conventional OS.
 
+## What it is for
+
+Everyday office work, education and software engineering — a general-purpose system, not a
+demo. Two constraints shape every decision, and they pull against each other on purpose:
+
+- **It must run well on the weakest hardware imaginable.** The goal is to make old and cheap
+  machines competitive again while hardware stays expensive. Memory is the scarce resource, then
+  storage, then CPU. A feature that costs megabytes of resident memory needs to justify itself
+  against the machine it prices out.
+- **Agents and people can both spin off containers.** Isolated execution is a system primitive,
+  not an add-on. This falls out of the capability model rather than fighting it: on a monolithic
+  kernel a container is a process with a retrofitted restricted view, whereas here a process only
+  ever holds the authority it was handed, so a container is simply a process given a curated set of
+  capabilities. Expect isolation to be cheap and the interesting questions to be about images,
+  compatibility and resource accounting instead.
+- **It is agent-native from the first commit.** Agents are first-class users of the system, able
+  to run, be interacted with, and eventually be built in — not an application layered on top.
+- **A task factory is a system service, not an app.** Work — a refactor, a spreadsheet, a lesson —
+  is something an agent can be given and carry to completion under supervision, with project
+  tracking and a human in the loop. Two parts of the design already carry most of this weight: an
+  approval by a human *is* a capability grant, and the audit journal *is* what tracking reads. Do
+  not design a second mechanism for either.
+
+The tension is the interesting part: agents are usually memory-hungry and the target machines are
+not. That is a design constraint, not a contradiction to wave away — expect inference to be
+remote-first with a local path where the hardware allows, and expect the agent interface to matter
+more than any bundled model.
+
 ## The design thesis
 
 Conventional systems expose their capabilities twice and badly: as text streams shaped for humans,
@@ -44,18 +72,21 @@ A Cargo workspace. Everything freestanding — the host toolchain must never lea
   use FP/SIMD registers before it saves them on context switch.
 - **QEMU** `virt` board is the reference machine. x86_64 is expected later; keep architecture
   assumptions inside clearly-named modules so that port is additive.
-- Installed through Homebrew, so the shims are **not** on the default PATH:
-  ```
-  export PATH="$(brew --prefix rustup)/bin:$PATH"
-  ```
+- Installed via rustup from rust-lang.org, so the shims are at `~/.cargo/bin` and the standard
+  `~/.cargo/env` puts them on PATH. The scripts source it themselves when a shell has not.
 
 # Building and running
 
 ```
-cargo build              # build the kernel
-cargo run                # build and boot it under QEMU (Ctrl-A X to quit)
-./scripts/boot-test.sh   # build and assert it boots cleanly — this is the test suite
+./scripts/run.sh         # build and boot it (Ctrl-A X to quit); --accel for host-CPU speed
+./scripts/check.sh       # the full pre-commit gate: fmt, clippy, host tests, boot
+./scripts/test.sh        # host unit tests for the portable crates
+./scripts/boot-test.sh   # assert a clean boot; this is what CI runs
 ```
+
+The scripts locate the toolchain themselves via `scripts/_toolchain.sh`. Never assume `cargo` is
+directly invocable: a non-interactive shell or a CI runner can have a perfectly good install and
+still not have it on PATH.
 
 `OXYGEN_SELFTEST=1` makes the kernel exit via semihosting instead of halting, which is what turns
 a boot into a pass/fail result. Semihosting is an emulator debug channel: it is scaffolding for

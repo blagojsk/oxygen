@@ -6,6 +6,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+. scripts/_toolchain.sh
 TARGET=aarch64-unknown-none-softfloat
 PROFILE=${PROFILE:-debug}
 KERNEL="target/$TARGET/$PROFILE/oxygen-kernel"
