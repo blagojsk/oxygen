@@ -10,8 +10,34 @@
 //! saves state and calls into Rust.
 
 use core::arch::global_asm;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::println;
+
+/// Set by the selftest immediately before it writes to `.text` on purpose.
+///
+/// Without this the write would be reported as a fatal kernel fault, which is exactly what it
+/// would be at any other moment. Announcing the expectation is what turns a crash into an
+/// assertion.
+static EXPECT_WRITE_FAULT: AtomicBool = AtomicBool::new(false);
+
+/// Arms the check above.
+pub fn expect_write_fault() {
+    EXPECT_WRITE_FAULT.store(true, Ordering::SeqCst);
+}
+
+/// Whether an ESR describes a *permission* fault on a write, as opposed to a translation fault
+/// (nothing mapped) or an alignment fault. The distinction is the whole point: an unmapped page
+/// would also stop the write, and would prove nothing about permissions.
+fn is_permission_write_fault(esr: u64) -> bool {
+    let ec = esr >> 26;
+    let iss = esr & 0x1FF_FFFF;
+    // DFSC 0b0011LL is a permission fault, where LL is the level that refused it.
+    let permission_fault = matches!(iss & 0x3F, 0b001100..=0b001111);
+    let write = (iss >> 6) & 1 == 1;
+    // Data abort, taken from the current EL (0b100101) or a lower one (0b100100).
+    matches!(ec, 0b100100 | 0b100101) && permission_fault && write
+}
 
 /// Registers saved on exception entry.
 ///
@@ -215,7 +241,6 @@ fatal_trap! {
     trap_irq_sp0       => "irq (SP0)",
     trap_fiq_sp0       => "fiq (SP0)",
     trap_serror_sp0    => "serror (SP0)",
-    trap_sync          => "synchronous (kernel)",
     trap_fiq           => "fiq (kernel)",
     trap_serror        => "serror (kernel)",
     trap_sync_lower    => "synchronous (user)",
@@ -225,6 +250,19 @@ fatal_trap! {
     trap_irq_lower32   => "irq (aarch32)",
     trap_fiq_lower32   => "fiq (aarch32)",
     trap_serror_lower32=> "serror (aarch32)",
+}
+
+/// Synchronous kernel exception.
+///
+/// Fatal, with one exception: the W^X selftest deliberately writes to `.text` and needs the fault
+/// it provokes to be treated as a pass. Anything else is a genuine kernel fault.
+#[unsafe(no_mangle)]
+extern "C" fn trap_sync(frame: &mut TrapFrame) -> ! {
+    if EXPECT_WRITE_FAULT.load(Ordering::SeqCst) && is_permission_write_fault(frame.esr) {
+        println!("  [selftest] write to .text refused by the MMU — W^X is enforced");
+        super::semihosting::exit(0);
+    }
+    fatal("synchronous (kernel)", frame)
 }
 
 /// Kernel IRQ. This one returns: an interrupt is a normal event, not a fault.

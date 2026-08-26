@@ -78,12 +78,23 @@ fn selftest() -> ! {
             semihosting::exit(1);
         }
     }
-
     println!(
         "  [selftest] {} timer interrupts delivered — ok",
         gic::ticks()
     );
-    semihosting::exit(0)
+
+    // Last, because it ends the run: prove W^X is enforced rather than merely configured.
+    // Reading the descriptors back would only confirm we wrote what we meant to; the hardware
+    // refusing the write is the actual guarantee. The fault handler recognises this one and exits
+    // 0, so reaching the line after the write means protection is NOT in effect.
+    exceptions::expect_write_fault();
+    let text = mmu::text_address() as *mut u8;
+    // SAFETY: deliberately illegal. The MMU is expected to refuse this, and the selftest fails
+    // loudly below if it does not.
+    unsafe { core::ptr::write_volatile(text, 0xFF) };
+
+    println!("  [selftest] write to .text SUCCEEDED — W^X is NOT enforced — FAILED");
+    semihosting::exit(1)
 }
 
 /// Where every unrecoverable error ends up.
