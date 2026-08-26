@@ -1,0 +1,8 @@
+[package]
+name = "oxygen-aarch64"
+description = "AArch64 encodings that are pure arithmetic, and so can be tested off-hardware"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

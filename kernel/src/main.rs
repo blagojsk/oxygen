@@ -3,16 +3,16 @@
 //! An operating system for agents and humans in equal measure, built to make weak and old hardware
 //! useful again.
 //!
-//! Milestone 1: the machine can be interrupted. Exceptions are routed through our own vector table,
-//! the interrupt controller is up, and a timer ticks — which is the prerequisite for ever
-//! preempting anything.
+//! Milestone 2 in progress: the machine can be interrupted, and translation is on. Virtual memory
+//! is the prerequisite for isolating anything from anything else, and therefore for processes,
+//! containers and agents that cannot reach past their own boundaries.
 
 #![no_std]
 #![no_main]
 
 mod arch;
 
-use arch::target::{self, exceptions, gic, semihosting, timer};
+use arch::target::{self, exceptions, gic, mmu, semihosting, timer};
 
 /// Set by the harness when the kernel is booted as a test rather than for a human to watch.
 const SELFTEST: bool = option_env!("OXYGEN_SELFTEST").is_some();
@@ -34,6 +34,10 @@ pub extern "C" fn kernel_main() -> ! {
     unsafe {
         exceptions::init();
         println!("  [trap] vector table installed");
+        // Before the GIC, because its registers are reached through the device mapping this
+        // installs — and because turning translation on is least dangerous while the system is
+        // still quiet.
+        mmu::init();
         gic::init();
         timer::init();
         target::enable_irqs();
@@ -58,6 +62,12 @@ pub extern "C" fn kernel_main() -> ! {
 fn selftest() -> ! {
     const REQUIRED: u64 = 5;
     const PATIENCE: u64 = 200_000_000;
+
+    if !mmu::is_enabled() {
+        println!("  [selftest] MMU reported disabled after init — FAILED");
+        semihosting::exit(1);
+    }
+    println!("  [selftest] translation is on and we are still executing — ok");
 
     let mut spins = 0u64;
     while gic::ticks() < REQUIRED {
