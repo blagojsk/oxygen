@@ -1,26 +1,22 @@
-# Locates the Rust toolchain, so the scripts work in a plain shell with nothing configured.
+# Locates the Rust toolchain, so the scripts work in a shell that has not sourced it.
 #
-# Homebrew's rustup keeps its shims in its own prefix rather than ~/.cargo/bin, and that prefix is
-# not on the default PATH. Rather than require every user to edit a shell profile before the OS
-# will build, the scripts find it themselves.
+# rustup installs to ~/.cargo/bin and its installer offers to add that to PATH, but a
+# non-interactive shell, a fresh terminal or a CI runner may not have it. Finding it here means the
+# scripts never depend on the caller's environment being set up.
 if ! command -v cargo >/dev/null 2>&1; then
-  for candidate in \
-    "$HOME/.cargo/bin" \
-    "$(brew --prefix rustup 2>/dev/null)/bin" \
-    "/opt/homebrew/opt/rustup/bin" \
-    "/usr/local/opt/rustup/bin"
-  do
-    if [ -x "$candidate/cargo" ]; then
-      PATH="$candidate:$PATH"
-      export PATH
-      break
-    fi
-  done
+  if [ -f "$HOME/.cargo/env" ]; then
+    # shellcheck disable=SC1091
+    . "$HOME/.cargo/env"
+  elif [ -x "$HOME/.cargo/bin/cargo" ]; then
+    PATH="$HOME/.cargo/bin:$PATH"
+    export PATH
+  fi
 fi
 
 if ! command -v cargo >/dev/null 2>&1; then
   echo "error: cargo not found." >&2
-  echo "       install it with:  brew install rustup && rustup default nightly" >&2
+  echo "       install it the way the Rust docs recommend:" >&2
+  echo "       curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh" >&2
   exit 1
 fi
 

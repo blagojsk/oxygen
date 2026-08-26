@@ -25,8 +25,8 @@ The script finds the toolchain itself, so nothing needs to be on your `PATH` fir
 QEMU are missing it says which and how to install them:
 
 ```bash
-brew install rustup qemu
-rustup default nightly
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh   # Rust, per rust-lang.org
+brew install qemu                                                # the machine to boot on
 ```
 
 Want it fast? `./scripts/run.sh --accel` runs the guest on your Mac's own CPU through Apple's

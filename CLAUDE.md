@@ -72,10 +72,8 @@ A Cargo workspace. Everything freestanding — the host toolchain must never lea
   use FP/SIMD registers before it saves them on context switch.
 - **QEMU** `virt` board is the reference machine. x86_64 is expected later; keep architecture
   assumptions inside clearly-named modules so that port is additive.
-- Installed through Homebrew, so the shims are **not** on the default PATH:
-  ```
-  export PATH="$(brew --prefix rustup)/bin:$PATH"
-  ```
+- Installed via rustup from rust-lang.org, so the shims are at `~/.cargo/bin` and the standard
+  `~/.cargo/env` puts them on PATH. The scripts source it themselves when a shell has not.
 
 # Building and running
 
@@ -86,9 +84,9 @@ A Cargo workspace. Everything freestanding — the host toolchain must never lea
 ./scripts/boot-test.sh   # assert a clean boot; this is what CI runs
 ```
 
-The scripts locate the toolchain themselves via `scripts/_toolchain.sh`, because Homebrew's rustup
-keeps its shims off the default PATH. Never assume `cargo` is directly invocable — a contributor
-with a working install can still have no `cargo` on their PATH.
+The scripts locate the toolchain themselves via `scripts/_toolchain.sh`. Never assume `cargo` is
+directly invocable: a non-interactive shell or a CI runner can have a perfectly good install and
+still not have it on PATH.
 
 `OXYGEN_SELFTEST=1` makes the kernel exit via semihosting instead of halting, which is what turns
 a boot into a pass/fail result. Semihosting is an emulator debug channel: it is scaffolding for
