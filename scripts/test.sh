@@ -5,6 +5,7 @@
 # otherwise cargo tries to link a test harness for a target that has no `test` crate.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+. scripts/_toolchain.sh
 HOST=$(rustc -vV | awk '/^host:/ {print $2}')
 echo "==> host tests on $HOST"
 cargo test --workspace --exclude oxygen-kernel --target "$HOST" "$@"

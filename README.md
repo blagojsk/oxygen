@@ -10,34 +10,41 @@ agents have to scrape and guess at, and as rigid ABIs that nothing can discover 
 starts from the opposite premise — a capability is one typed, self-describing thing, rendered for
 whoever is asking.
 
-**Status: milestone 0.** It boots on bare metal and can speak. That is all it does. Everything
-below M0 in the roadmap is unwritten.
+**Status: milestone 1.** It boots on bare metal, routes its own exceptions, and takes timer
+interrupts. It cannot yet manage memory, run a thread, or hold a conversation.
 
-## Requirements
+## Starting it
 
-- Rust nightly (pinned by `rust-toolchain.toml`)
-- QEMU with `qemu-system-aarch64`
+```bash
+./scripts/run.sh
+```
+
+That is the whole thing. It builds the kernel and boots it — press **Ctrl-A** then **X** to quit.
+
+The script finds the toolchain itself, so nothing needs to be on your `PATH` first. If Rust or
+QEMU are missing it says which and how to install them:
 
 ```bash
 brew install rustup qemu
-export PATH="$(brew --prefix rustup)/bin:$PATH"
+rustup default nightly
 ```
 
-## Running it
+Want it fast? `./scripts/run.sh --accel` runs the guest on your Mac's own CPU through Apple's
+hypervisor instead of emulating it.
+
+### There is no Docker here
+
+A container shares the host's kernel — that is what makes it a container — so it cannot boot a
+kernel of its own. Running an OS needs a *machine*, and QEMU is that machine. On Apple Silicon,
+Docker would additionally be running its own Linux VM, so you would be emulating inside a virtual
+machine to do what `./scripts/run.sh` already does directly.
+
+### Other commands
 
 ```bash
-cargo run                # boot under QEMU — Ctrl-A then X to quit
-./scripts/boot-test.sh   # build and assert a clean boot
-```
-
-Expected output:
-
-```
-  oxygen 0.0.1
-  an operating system for agents and humans
-
-  [boot] aarch64 · qemu virt · EL1
-  [boot] stack installed, .bss zeroed, rust reached
+./scripts/check.sh       # everything that must pass before a commit
+./scripts/test.sh        # host unit tests for the portable crates
+./scripts/boot-test.sh   # assert the kernel boots cleanly, for CI
 ```
 
 ## Where it runs
@@ -51,8 +58,8 @@ modules so that port is additive rather than a rewrite.
 | | Milestone | State |
 | --- | --- | --- |
 | M0 | Boots, reaches Rust, serial output, panic handling | **done** |
-| M1 | Exception vectors, timer interrupt, physical frame allocator | next |
-| M2 | MMU, page tables, kernel heap | |
+| M1 | Exception vectors, GIC, timer interrupt, physical frame allocator | **done** |
+| M2 | MMU, page tables, kernel heap | next |
 | M3 | Threads and a scheduler | |
 | M4 | User mode, syscalls, capability handles | |
 | M5 | Typed IPC and the capability registry | |

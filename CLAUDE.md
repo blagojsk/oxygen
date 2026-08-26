@@ -80,10 +80,15 @@ A Cargo workspace. Everything freestanding — the host toolchain must never lea
 # Building and running
 
 ```
-cargo build              # build the kernel
-cargo run                # build and boot it under QEMU (Ctrl-A X to quit)
-./scripts/boot-test.sh   # build and assert it boots cleanly — this is the test suite
+./scripts/run.sh         # build and boot it (Ctrl-A X to quit); --accel for host-CPU speed
+./scripts/check.sh       # the full pre-commit gate: fmt, clippy, host tests, boot
+./scripts/test.sh        # host unit tests for the portable crates
+./scripts/boot-test.sh   # assert a clean boot; this is what CI runs
 ```
+
+The scripts locate the toolchain themselves via `scripts/_toolchain.sh`, because Homebrew's rustup
+keeps its shims off the default PATH. Never assume `cargo` is directly invocable — a contributor
+with a working install can still have no `cargo` on their PATH.
 
 `OXYGEN_SELFTEST=1` makes the kernel exit via semihosting instead of halting, which is what turns
 a boot into a pass/fail result. Semihosting is an emulator debug channel: it is scaffolding for

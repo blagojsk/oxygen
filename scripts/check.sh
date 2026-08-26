@@ -6,6 +6,7 @@
 # --all-targets on bare metal fails to link a `test` crate that no freestanding target has.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+. scripts/_toolchain.sh
 HOST=$(rustc -vV | awk '/^host:/ {print $2}')
 
 echo "==> fmt"
