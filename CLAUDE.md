@@ -126,6 +126,29 @@ Imperative, under ~72 characters, with the why and any caveats in the body.
 - CI configuration under `.github/workflows/` may be changed on the default branch directly.
 - This applies per request: a merge approved once does not authorise the next.
 
+# Model use and delegation
+
+Match the model to the job, and spend the expensive ones on thinking rather than typing. Whichever
+model is running as the primary delegates work *downward*, never sideways or up:
+
+| Primary | Delegates to | Does itself |
+| --- | --- | --- |
+| **Fable** | Opus or Sonnet | Planning and orchestration only — no implementation |
+| **Opus** | Sonnet or Haiku | Plans, then implements only what genuinely needs its judgement |
+| **Sonnet** | Haiku | Implementation |
+
+**Pick the cheapest worker that will do the job well — never default to the most capable one.**
+Choosing the strongest model available for every task wastes the budget that makes delegation
+worth doing, and it is the primary's job to make that call, task by task, on how much judgement
+the work actually needs.
+
+As a guide: unfamiliar design, subtle concurrency, `unsafe` whose soundness argument is not
+obvious, and anything where being wrong is expensive and quiet — kernel bring-up, page tables,
+capability logic — go to the stronger worker. Mechanical refactors, moving code between modules,
+writing tests against a settled contract, boilerplate, and repetitive edits with a clear
+specification go to the cheaper one. When a cheap worker returns something wrong, escalate that
+task rather than lowering the bar for the next one.
+
 # Before making a commit or providing a suggestion
 
 - `cargo build` cleanly.
