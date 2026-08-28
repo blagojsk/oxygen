@@ -10,7 +10,11 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 mod arch;
+mod mm;
+mod sync;
 
 use arch::target::{self, exceptions, gic, mmu, semihosting, timer};
 
@@ -38,6 +42,9 @@ pub extern "C" fn kernel_main() -> ! {
         // installs — and because turning translation on is least dangerous while the system is
         // still quiet.
         mmu::init();
+        // After the MMU, because the heap's memory is only usable once the identity map covers
+        // it, and before the GIC so later bring-up can allocate if it needs to.
+        mm::init();
         gic::init();
         timer::init();
         target::enable_irqs();
@@ -82,6 +89,35 @@ fn selftest() -> ! {
         "  [selftest] {} timer interrupts delivered — ok",
         gic::ticks()
     );
+
+    // Prove the heap actually works, rather than merely reporting a size. Growing a Vec past its
+    // initial capacity forces a real allocate-copy-free cycle through the global allocator.
+    {
+        use alloc::vec::Vec;
+        let before = mm::heap_used();
+        let mut v: Vec<u64> = Vec::new();
+        for i in 0..1024 {
+            v.push(i);
+        }
+        let sum: u64 = v.iter().sum();
+        if sum != (0..1024u64).sum::<u64>() {
+            println!("  [selftest] heap returned wrong data — FAILED");
+            semihosting::exit(1);
+        }
+        if mm::heap_used() <= before {
+            println!("  [selftest] heap reported no usage after allocating — FAILED");
+            semihosting::exit(1);
+        }
+        drop(v);
+        if mm::heap_used() != before {
+            println!("  [selftest] heap leaked across a drop — FAILED");
+            semihosting::exit(1);
+        }
+        println!(
+            "  [selftest] heap: 1024 items allocated, summed and freed cleanly, {} KiB free — ok",
+            mm::heap_free() / 1024
+        );
+    }
 
     // Last, because it ends the run: prove W^X is enforced rather than merely configured.
     // Reading the descriptors back would only confirm we wrote what we meant to; the hardware

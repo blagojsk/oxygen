@@ -8,9 +8,137 @@
 
 pub mod addr;
 pub mod frame;
+pub mod heap;
 
 pub use addr::{FRAME_SIZE, Frame, PhysAddr};
 pub use frame::{AllocError, FrameAllocator};
+pub use heap::Heap;
+
+#[cfg(test)]
+extern crate std;
+
+#[cfg(test)]
+mod heap_tests {
+    use super::heap::Heap;
+    use core::alloc::Layout;
+    use std::vec::Vec;
+
+    /// 64 KiB of host memory standing in for a mapped region. Leaked on purpose: the heap hands
+    /// out pointers into it, so it must outlive every test that uses it.
+    fn region(bytes: usize) -> *mut u8 {
+        let v: Vec<u8> = std::vec![0u8; bytes];
+        std::boxed::Box::leak(v.into_boxed_slice()).as_mut_ptr()
+    }
+
+    fn heap_of(bytes: usize) -> Heap {
+        let mut h = Heap::new();
+        // SAFETY: the region is leaked, so it stays valid for the whole test.
+        unsafe { h.add_region(region(bytes), bytes) };
+        h
+    }
+
+    fn layout(size: usize, align: usize) -> Layout {
+        Layout::from_size_align(size, align).unwrap()
+    }
+
+    #[test]
+    fn allocates_and_reports_usage() {
+        let mut h = heap_of(4096);
+        assert_eq!(h.used(), 0);
+        // SAFETY: standard allocator use within a live heap.
+        let p = unsafe { h.alloc(layout(64, 8)) };
+        assert!(!p.is_null());
+        assert!(h.used() >= 64);
+        assert!(h.free() < h.size());
+    }
+
+    #[test]
+    fn allocations_do_not_overlap() {
+        let mut h = heap_of(4096);
+        // SAFETY: as above.
+        let (a, b) = unsafe { (h.alloc(layout(64, 8)), h.alloc(layout(64, 8))) };
+        assert!(!a.is_null() && !b.is_null());
+        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+        assert!(hi as usize - lo as usize >= 64, "allocations overlap");
+    }
+
+    #[test]
+    fn honours_alignment() {
+        let mut h = heap_of(8192);
+        for align in [8usize, 16, 32, 64, 256] {
+            // SAFETY: as above.
+            let p = unsafe { h.alloc(layout(32, align)) };
+            assert!(!p.is_null());
+            assert_eq!(p as usize % align, 0, "misaligned for {align}");
+        }
+    }
+
+    #[test]
+    fn freed_memory_is_reused() {
+        let mut h = heap_of(4096);
+        // SAFETY: allocate, release, allocate the same shape again.
+        let first = unsafe { h.alloc(layout(128, 8)) };
+        unsafe { h.dealloc(first, layout(128, 8)) };
+        assert_eq!(h.used(), 0);
+        let second = unsafe { h.alloc(layout(128, 8)) };
+        assert_eq!(first, second, "the freed block should be handed back out");
+    }
+
+    /// The property that keeps a long-lived kernel alive. Without coalescing, a heap fragments
+    /// into rubble after enough cycles and behaves exactly like a leak.
+    #[test]
+    fn adjacent_frees_coalesce_back_into_one_block() {
+        let mut h = heap_of(4096);
+        // SAFETY: three adjacent allocations, then all released.
+        unsafe {
+            let a = h.alloc(layout(256, 8));
+            let b = h.alloc(layout(256, 8));
+            let c = h.alloc(layout(256, 8));
+            h.dealloc(a, layout(256, 8));
+            h.dealloc(b, layout(256, 8));
+            h.dealloc(c, layout(256, 8));
+        }
+        assert_eq!(h.used(), 0);
+        // If the three blocks merged, one allocation larger than any single block succeeds.
+        // SAFETY: as above.
+        let big = unsafe { h.alloc(layout(700, 8)) };
+        assert!(!big.is_null(), "blocks did not coalesce");
+    }
+
+    #[test]
+    fn returns_null_when_exhausted_rather_than_misbehaving() {
+        let mut h = heap_of(1024);
+        // SAFETY: deliberately larger than the heap.
+        let p = unsafe { h.alloc(layout(65536, 8)) };
+        assert!(p.is_null());
+    }
+
+    /// Churn with mixed sizes: the heap must not lose memory across many cycles.
+    #[test]
+    fn survives_repeated_churn_without_leaking() {
+        let mut h = heap_of(16 * 1024);
+        let total = h.size();
+        for round in 0..200 {
+            let size = 32 + (round % 7) * 48;
+            // SAFETY: each pointer is freed with the layout it was allocated with.
+            unsafe {
+                let p = h.alloc(layout(size, 8));
+                assert!(!p.is_null(), "exhausted at round {round}");
+                h.dealloc(p, layout(size, 8));
+            }
+        }
+        assert_eq!(h.used(), 0);
+        assert_eq!(h.size(), total);
+    }
+
+    #[test]
+    fn a_zero_sized_request_still_returns_something_usable() {
+        let mut h = heap_of(4096);
+        // SAFETY: zero-sized layouts are rounded up to the minimum block.
+        let p = unsafe { h.alloc(layout(0, 1)) };
+        assert!(!p.is_null());
+    }
+}
 
 #[cfg(test)]
 mod tests {
