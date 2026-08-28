@@ -1,6 +1,7 @@
 //! AArch64 support: boot, exceptions, interrupt controller, timer, console.
 
 pub mod boot;
+pub mod context;
 pub mod exceptions;
 pub mod gic;
 pub mod mmu;

@@ -266,9 +266,20 @@ extern "C" fn trap_sync(frame: &mut TrapFrame) -> ! {
 }
 
 /// Kernel IRQ. This one returns: an interrupt is a normal event, not a fault.
+///
+/// Preemption happens here rather than inside the GIC handler, once the interrupt has been
+/// acknowledged and ended. Switching threads with an interrupt still active would stall every
+/// other interrupt at that priority for as long as the next thread runs.
+///
+/// The switch is safe at this point precisely because each thread has its own kernel stack: this
+/// thread's full register state is already saved in the trap frame below us, and stays there until
+/// it is scheduled again and this handler returns.
 #[unsafe(no_mangle)]
 extern "C" fn trap_irq(_frame: &mut TrapFrame) {
     super::gic::handle_irq();
+    if crate::sched::reschedule_requested() {
+        crate::sched::yield_now();
+    }
 }
 
 /// IRQ taken while userspace was running. Same handling for now; it diverges once there are
