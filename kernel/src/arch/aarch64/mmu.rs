@@ -121,6 +121,18 @@ pub unsafe fn init() {
                 pa += L3_PAGE_SIZE;
             }
         }
+
+        // The rest of the 2 MiB this L3 table covers is ordinary RAM and must be mapped too.
+        // Leaving it blank is not harmless: the frame allocator hands out memory immediately above
+        // the kernel image, so the very first heap frame lands here and faults on a page that was
+        // never mapped. Read/write, never executable — the kernel image above is the only
+        // executable region in the system.
+        let mut pa = kernel_end;
+        while pa < RAM_BASE + L2_BLOCK_SIZE {
+            let index = paging::index_for(pa, 3);
+            (*l3).0[index] = paging::page(pa, MemoryKind::Normal, Access::KernelData);
+            pa += L3_PAGE_SIZE;
+        }
     }
 
     let ttbr0 = l1 as u64;
@@ -162,6 +174,12 @@ pub unsafe fn init() {
         "  [mmu]  translation on — {} KiB kernel image at 4 KiB pages, W^X enforced",
         (kernel_end - kernel_start) / 1024
     );
+}
+
+/// End of the kernel image, page-aligned. Everything above this is free RAM as far as the frame
+/// allocator is concerned; everything below is the kernel and must never be handed out.
+pub fn kernel_end() -> u64 {
+    sym(unsafe { &__kernel_end })
 }
 
 /// Address of a byte inside `.text`, for the selftest that proves code is not writable.
