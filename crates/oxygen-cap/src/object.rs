@@ -15,4 +15,9 @@ pub enum Object {
     Task(u64),
     /// A range of physical memory this capability grants access to.
     Memory { base: u64, len: u64 },
+    /// An IPC endpoint, named by its kernel-assigned id. `WRITE` sends to it, `READ` receives.
+    Endpoint(u64),
+    /// The name registry. Holding this is what lets a task ask what exists by name, so that
+    /// discovery is itself an authority somebody granted rather than something every task has.
+    Registry,
 }

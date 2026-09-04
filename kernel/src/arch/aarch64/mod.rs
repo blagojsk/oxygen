@@ -35,7 +35,16 @@ pub unsafe fn enable_irqs() {
 
 pub fn wait_for_interrupt() -> ! {
     loop {
-        // SAFETY: WFI parks the core until an interrupt arrives; it has no other effect.
-        unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
+        wait_for_interrupt_once();
     }
+}
+
+/// Parks the core until the next interrupt, then returns.
+///
+/// The single-shot form exists for a thread that has nothing to do but is not finished — it must
+/// come back and re-check the condition it is waiting on. Spinning instead would be correct and
+/// would also burn a whole core, which on a single-core board is the entire machine.
+pub fn wait_for_interrupt_once() {
+    // SAFETY: WFI parks the core until an interrupt arrives; it has no other effect.
+    unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
 }

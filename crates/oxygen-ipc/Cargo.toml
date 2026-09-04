@@ -1,0 +1,8 @@
+[package]
+name = "oxygen-ipc"
+description = "Portable IPC logic: fixed-size typed messages, a ring-buffer queue, and the name registry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

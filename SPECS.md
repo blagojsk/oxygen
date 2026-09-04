@@ -60,9 +60,11 @@ A Cargo workspace. Everything freestanding.
 | `kernel/src/arch/aarch64/` | everything that knows about a specific CPU or interrupt controller |
 | `kernel/linker.ld` | memory layout; `build.rs` passes it to the linker |
 | `kernel/src/syscall.rs` | the system call surface — everything EL0 can ask for |
+| `kernel/src/ipc.rs` | endpoints, blocking, and the name registry |
 | `crates/oxygen-mem/` | portable memory logic: addresses, frame allocator, heap |
 | `crates/oxygen-aarch64/` | AArch64 encodings that are pure arithmetic |
 | `crates/oxygen-cap/` | portable capability logic: handles, rights, derivation, revocation |
+| `crates/oxygen-ipc/` | portable message, queue and registry logic |
 | `scripts/` | developer and CI entry points |
 | `.cargo/config.toml` | default target and the QEMU runner |
 | `rust-toolchain.toml` | pinned compiler, components and target |
@@ -104,8 +106,9 @@ fixed order, and the order is the load-bearing fact.*
 | 5 | Adopts the running code as thread 0 | `sched.rs` |
 | 6 | Brings up the GIC distributor and CPU interface | `arch/aarch64/gic.rs` |
 | 7 | Starts the generic timer | `arch/aarch64/timer.rs` |
-| 8 | Loads the user programs into a page and narrows it to EL0 read-execute | `arch/aarch64/user.rs` |
-| 9 | Unmasks IRQs | `arch/aarch64/mod.rs` |
+| 8 | Creates the endpoint table and the name registry | `ipc.rs` |
+| 9 | Loads the user programs into a page and narrows it to EL0 read-execute | `arch/aarch64/user.rs` |
+| 10 | Unmasks IRQs | `arch/aarch64/mod.rs` |
 
 Order is load-bearing: vectors before any interrupt can be delivered, the MMU before the GIC whose registers
 are reached through the device mapping, the scheduler before the first timer tick asks for a reschedule.
@@ -192,9 +195,45 @@ it and it was withdrawn" is what a caller needs in order to react.
 | `SYS_DELEGATE` | `(handle, rights) -> handle` — requires `GRANT` |
 | `SYS_REVOKE` | `(handle) -> how many were withdrawn` — requires `REVOKE` |
 | `SYS_EXIT` | `(code)`, does not return |
+| `SYS_ENDPOINT` | `() -> handle` — a new endpoint, with every right, because the caller made it |
+| `SYS_SEND` | `(handle, interface, method, ptr, len) -> 0` — requires `WRITE` |
+| `SYS_RECV` | `(handle, ptr, cap) -> bytes written` — requires `READ`; blocks |
+| `SYS_LOOKUP` | `(registry, name_ptr, name_len) -> handle` — requires `READ` on the registry |
+| `SYS_REGISTER` | `(registry, name_ptr, name_len, endpoint) -> 0` — requires `WRITE` on the registry and `GRANT` on the endpoint |
 
 Every pointer argument is checked against the calling thread's own pages before the kernel dereferences it.
 Without that check a handle with entirely legitimate rights becomes a way to print kernel memory.
+
+## IPC and the registry
+
+Two tasks that cannot name the same thing cannot talk. A capability cannot yet cross a task
+boundary, so the only thing two tasks can both name is a *name* — which is what the registry is
+for, and why it arrived in the same milestone as messaging rather than later.
+
+| | |
+| --- | --- |
+| Message | `interface: u32`, `method: u32`, `len: u32`, then up to 64 bytes inline |
+| Typed | Interface `0` is reserved and rejected, so "you forgot to say what this is" is a caught error rather than a message that silently means nothing |
+| Queue | 8 messages per endpoint, a real ring buffer. Shallow on purpose: a deep queue turns a receiver that stopped keeping up into memory the kernel holds on its behalf, and tells the sender far too late |
+| Endpoint ids | Start at 1, so a zeroed field never names one |
+| Registry | 16 names, each 1–16 bytes of printable ASCII, enumerable |
+
+A payload is fixed and inline rather than a pointer to be copied later: a message that never
+allocates and never outlives the call that sent it is the only shape that stays affordable on a
+machine measured in tens of megabytes.
+
+Names are restricted to printable ASCII because this surface is read by both audiences. A name that
+can hold a control byte or a space is one that cannot be printed back to a human unambiguously.
+
+**Blocking.** A receiver with an empty queue leaves the run queue entirely; a sender wakes everyone
+parked on that endpoint and lets them race for it. Waking one — picking a winner — would be a
+scheduling policy hidden inside a message queue; the loser finds the queue empty and parks again,
+which is correct with nothing coordinating it. `send` releases the endpoint lock before taking the
+scheduler's, so no path holds both.
+
+Discovery is itself an authority: looking a name up requires a capability on the registry. A
+capability handed back by `SYS_LOOKUP` carries `READ | WRITE` but never `GRANT` — finding a service
+lets you talk to it, not advertise it as yours.
 
 ## Scheduling
 
@@ -257,8 +296,8 @@ its prior usage, and a write to `.text` is refused by the hardware.
 | M2 | MMU, per-section mapping with W^X, kernel heap | done |
 | M3 | Threads, context switch, preemptive scheduler | done |
 | M4 | User mode, syscalls, capability handles | done |
-| M5 | Typed IPC and the capability registry | next |
-| M6 | Userspace services — console, shell | not started |
+| M5 | Typed IPC and the capability registry | done |
+| M6 | Userspace services — console, shell | next |
 | M7 | Agent surface: schema discovery, audit journal | not started |
 
 M0–M3 was conventional kernel work. M4 is where the thesis starts paying: authority is a handle the kernel
@@ -299,9 +338,27 @@ holds.
   task to grant another.
 - **Why it waits.** It needs a second task to grant to, and the derivation links are `u32` indices into one
   table — crossing spaces means saying what a parent index means when the parent lives elsewhere.
-- **Prerequisites (owner).** Reopens with M5, which is the first time two tasks must name the same object.
+- **Prerequisites (owner).** M5 shipped without it: the registry lets two tasks find the same endpoint
+  by name, which is enough to talk and not enough to hand over authority. Reopens at M6, where a service
+  must give a caller a capability to something it created.
 
-**5. Loading a program from storage — PARKED**
+**5. Request and reply as one operation — PARKED**
+
+- **What.** A `call` that sends and waits for the answer on a reply channel, instead of the sender and the
+  receiver each having to own an endpoint and find each other twice.
+- **Why it waits.** A reply channel is a capability handed to the receiver for one use, which is the
+  cross-task delegation above. Send-only is enough to prove the path works.
+- **Prerequisites (owner).** Blocked on entry 4.
+
+**6. Destroying an endpoint — PARKED**
+
+- **What.** Endpoints are created and never freed, so the table only grows.
+- **Why it waits.** Nothing creates them in a loop yet. Freeing one means deciding what happens to threads
+  blocked on it and to capabilities still naming it — the same question revocation answers for capabilities,
+  and it should get the same answer rather than a second mechanism.
+- **Prerequisites (owner).** Reopens when a task can exit and take its endpoints with it.
+
+**7. Loading a program from storage — PARKED**
 
 - **What.** Reading a user program from a filesystem rather than assembling it into the kernel image.
 - **Why it waits.** There is no storage driver and no filesystem. The loader itself already does the part
@@ -309,39 +366,39 @@ holds.
   what is missing is where the bytes come from, not what is done with them.
 - **Prerequisites (owner).** Reopens at M6, with the first userspace service that has to be started.
 
-**6. Kernel heap growth on demand — PARKED**
+**8. Kernel heap growth on demand — PARKED**
 
 - **What.** Extend the heap from free frames when it is exhausted, rather than fixing it at 2 MiB.
 - **Why it waits.** 2 MiB is sufficient for the current kernel, and a kernel that reserves tens of megabytes
   for itself has spent what the user came for.
 - **Prerequisites (owner).** Reopens when an allocation fails; needs a fault handler to trigger growth.
 
-**7. On-target test framework — PARKED**
+**9. On-target test framework — PARKED**
 
 - **What.** `custom_test_frameworks` so tests run inside the kernel, for behaviour that needs real hardware:
   MMU semantics, exception delivery, context switching.
 - **Why it waits.** The boot assertions cover the current surface.
 - **Prerequisites (owner).** Reopens when a test needs hardware semantics that host arithmetic cannot model.
 
-**8. Hardware-accelerated test harness — CUT**
+**10. Hardware-accelerated test harness — CUT**
 
 - **What.** Running the automated boot test under HVF rather than TCG.
 - **Why.** HVF does not intercept the semihosting trap, so the exit code the harness depends on is lost. The
   kernel boots correctly under HVF, so `scripts/run.sh --accel` uses it for running; testing stays on TCG.
 
-**9. Buddy or size-class frame allocator — CUT**
+**11. Buddy or size-class frame allocator — CUT**
 
 - **What.** Replacing the bitmap with an allocator that serves large contiguous requests faster.
 - **Why.** Both keep per-block structures resident whether or not anything is allocated. The bitmap's flat
   cost of one bit per frame is the correct trade for the target hardware.
 
-**10. Saving the full register set on context switch — CUT**
+**12. Saving the full register set on context switch — CUT**
 
 - **What.** Preserving `x0`–`x18` in `Context` alongside the callee-saved registers.
 - **Why.** The procedure call standard already permits a function to destroy them, so the caller has
   preserved anything it needs. A preempted thread's full state is in its trap frame regardless.
 
-**11. Docker as a way to run Oxygen — CUT**
+**13. Docker as a way to run Oxygen — CUT**
 
 - **What.** Shipping a container image that boots the OS.
 - **Why.** A container shares the host kernel, so it cannot boot one of its own. Running an OS needs a
