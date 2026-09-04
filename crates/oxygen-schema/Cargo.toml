@@ -1,0 +1,9 @@
+[package]
+name = "oxygen-schema"
+description = "Portable schema logic: how a capability's interface is described, encoded on the wire, and looked up by id"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+oxygen-ipc = { path = "../oxygen-ipc" }
