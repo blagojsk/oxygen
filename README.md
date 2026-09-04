@@ -10,9 +10,20 @@ agents have to scrape and guess at, and as rigid ABIs that nothing can discover 
 starts from the opposite premise — a capability is one typed, self-describing thing, rendered for
 whoever is asking.
 
-**Status: milestone 3.** It boots on bare metal, routes its own exceptions, takes timer interrupts,
-maps itself with page tables that refuse a write to its own code, allocates from a kernel heap, and
-preempts between threads. It cannot yet run a line of user code, so it cannot yet hold a conversation.
+**Status: milestone 6 — it has a prompt.** Boot it and type at it:
+
+```
+oxygen$ services
+  echo
+oxygen$ echo it works
+it works
+```
+
+Underneath: it routes its own exceptions, maps itself with page tables that refuse a write to its
+own code, allocates from a kernel heap, and preempts between threads. Unprivileged programs reach
+the kernel only by presenting a capability — one that can be narrowed, handed on, and taken back
+again — and find each other by publishing endpoints under names, then exchanging typed messages
+over them. The shell is one of those programs, with no more authority than it was handed.
 
 ## Starting it
 
@@ -62,14 +73,17 @@ modules so that port is additive rather than a rewrite.
 | M1 | Exception vectors, GIC, timer interrupt, physical frame allocator | **done** |
 | M2 | MMU, per-section mapping with W^X, kernel heap | **done** |
 | M3 | Threads, context switch, preemptive scheduler | **done** |
-| M4 | User mode, syscalls, capability handles | next |
-| M5 | Typed IPC and the capability registry | |
-| M6 | Userspace services — console, shell | |
-| M7 | Agent surface: schema discovery, audit journal | |
+| M4 | User mode, syscalls, capability handles | **done** |
+| M5 | Typed IPC and the capability registry | **done** |
+| M6 | Userspace services — console, shell | **done** |
+| M7 | Agent surface: schema discovery, audit journal | next |
 
-M0–M3 is conventional kernel work that any OS needs. The thesis starts paying off at M4–M5, where
-capabilities become unforgeable handles and the IPC surface becomes typed and introspectable.
+M0–M3 was conventional kernel work that any OS needs. M4–M6 are where the thesis starts paying: a
+program holds no ambient authority, only handles the kernel checks — a grant can be withdrawn,
+because an approval nobody can take back is not an approval — and what those handles name is a
+typed, enumerable surface rather than a set of numbers you had to be told. `services` is that
+surface, seen by a human. M7 is the same surface seen by an agent.
 
 ## Licence
 
-MIT OR Apache-2.0.
+[MIT](LICENSE-MIT). Contributions are accepted under the same licence.

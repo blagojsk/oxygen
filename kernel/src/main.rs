@@ -15,11 +15,13 @@ use core::sync::atomic::{AtomicU64, Ordering};
 extern crate alloc;
 
 mod arch;
+mod ipc;
 mod mm;
 mod sched;
 mod sync;
+mod syscall;
 
-use arch::target::{self, exceptions, gic, mmu, semihosting, timer};
+use arch::target::{self, exceptions, gic, mmu, semihosting, timer, user};
 
 /// Set by the harness when the kernel is booted as a test rather than for a human to watch.
 const SELFTEST: bool = option_env!("OXYGEN_SELFTEST").is_some();
@@ -51,8 +53,15 @@ pub extern "C" fn kernel_main() -> ! {
         // Before interrupts, because the first timer tick asks for a reschedule and there must be
         // a current thread to reschedule away from.
         sched::init();
+        // After the heap, which the endpoint table and the registry both allocate from.
+        ipc::init();
         gic::init();
         timer::init();
+        // After the GIC, which owns the line it enables.
+        arch::target::uart::init_rx();
+        // After the MMU, which it needs in order to narrow a page's permissions, and before any
+        // thread can be entered into it.
+        user::load();
         target::enable_irqs();
     }
     println!("  [boot] interrupts enabled");
@@ -62,7 +71,10 @@ pub extern "C" fn kernel_main() -> ! {
         selftest()
     }
 
-    println!("  idle. interrupts are live — the timer is ticking.");
+    // A service to find, and something to find it with. The boot thread has nothing left to do
+    // but exist: it parks, and the timer preempts it into the shell.
+    sched::spawn("server", server_thread, 0);
+    sched::spawn("shell", shell_thread, 0);
     target::wait_for_interrupt()
 }
 
@@ -165,6 +177,94 @@ fn selftest() -> ! {
         );
     }
 
+    // Prove the privilege boundary exists and that capabilities are what crosses it. The user
+    // program runs at EL0, writes through a capability, derives a narrower one, revokes it, and
+    // reports back what the kernel refused the revoked handle with. Asserting on *which* refusal
+    // is the point: any error would prove the write failed, but only this one proves it failed
+    // because the grant was withdrawn.
+    {
+        let id = sched::spawn("user", user_thread, 0);
+        match await_exit(id, "the user thread") {
+            syscall::E_STALE => println!(
+                "  [selftest] EL0 wrote through a capability, then lost it to revocation — ok"
+            ),
+            sched::EXIT_FAULTED => {
+                println!("  [selftest] the user thread faulted instead of exiting — FAILED");
+                semihosting::exit(1);
+            }
+            other => {
+                println!(
+                    "  [selftest] user thread exited {other:#x}, expected a stale handle — FAILED"
+                );
+                semihosting::exit(1);
+            }
+        }
+    }
+
+    // The boundary itself. A user thread that reads kernel memory must die, and the kernel must
+    // not. Every fault before M4 was fatal to the machine because every fault was the kernel's;
+    // this asserts that is no longer true, which is the whole return on having a privilege level.
+    {
+        let id = sched::spawn(
+            "trespasser",
+            trespassing_thread,
+            mmu::text_address() as usize,
+        );
+        match await_exit(id, "the trespassing thread") {
+            sched::EXIT_FAULTED => {
+                println!("  [selftest] EL0 read of kernel memory faulted, kernel survived — ok")
+            }
+            other => {
+                println!("  [selftest] EL0 read kernel memory and exited {other:#x} — FAILED");
+                semihosting::exit(1);
+            }
+        }
+    }
+
+    // IPC. A server publishes an endpoint by name and blocks on it; a client that has never been
+    // told anything about the server finds it by that name and sends it a typed message. Three
+    // things are asserted rather than one: that the receiver genuinely leaves the run queue, that
+    // the payload arrives intact, and that a name nobody published cannot be found.
+    {
+        let server = sched::spawn("server", server_thread, 0);
+
+        let mut spins = 0u64;
+        while !matches!(sched::state_of(server), Some(sched::State::Blocked(_))) {
+            sched::yield_now();
+            spins += 1;
+            if spins > 5_000_000 {
+                println!("  [selftest] the server never blocked on its endpoint — FAILED");
+                sched::dump();
+                semihosting::exit(1);
+            }
+        }
+        println!("  [selftest] server is blocked on its endpoint, off the run queue — ok");
+        ipc::dump();
+
+        let client = sched::spawn("client", client_thread, 0);
+        if await_exit(client, "the client thread") != 0 {
+            println!("  [selftest] the client could not send — FAILED");
+            semihosting::exit(1);
+        }
+
+        match await_exit(server, "the server thread") {
+            42 => println!(
+                "  [selftest] a typed message crossed between two EL0 tasks that only shared a name — ok"
+            ),
+            other => {
+                println!("  [selftest] the server received {other:#x}, expected 42 — FAILED");
+                semihosting::exit(1);
+            }
+        }
+
+        let absent = oxygen_ipc::Name::new("nosuchservice").expect("a valid name");
+        if ipc::lookup(&absent).is_ok() {
+            println!("  [selftest] the registry found a name nobody published — FAILED");
+            semihosting::exit(1);
+        }
+        println!("  [selftest] an unpublished name is not found — ok");
+    }
+
     // Last, because it ends the run: prove W^X is enforced rather than merely configured.
     // Reading the descriptors back would only confirm we wrote what we meant to; the hardware
     // refusing the write is the actual guarantee. The fault handler recognises this one and exits
@@ -179,6 +279,87 @@ fn selftest() -> ! {
     semihosting::exit(1)
 }
 
+/// Gives the running thread the two capabilities every user program here is born holding.
+///
+/// Seeded explicitly, in code you can point at, rather than appearing as a property of having been
+/// created. A thread that was granted nothing can do nothing, and that has to be the default or
+/// the word "capability" is decoration.
+fn seed_capabilities() -> (u64, u64) {
+    use oxygen_cap::{Object, Rights};
+
+    let console = sched::with_caps(|caps| caps.insert(Object::Console, Rights::ALL))
+        .expect("a fresh capability space has room");
+    let registry = sched::with_caps(|caps| caps.insert(Object::Registry, Rights::ALL))
+        .expect("a fresh capability space has room");
+    (console.raw(), registry.raw())
+}
+
+/// The kernel half of the first user thread: the one that exercises capabilities.
+extern "C" fn user_thread(_arg: usize) {
+    let (console, registry) = seed_capabilities();
+    // SAFETY: the loader prepared and mapped this entry and stack for EL0 during boot, and no
+    // other thread uses stack slot 0.
+    unsafe { user::enter(user::program(), user::stack_top(0), console, registry) }
+}
+
+/// A user thread that reads where it may not, so the refusal can be observed.
+///
+/// The address it is given is a kernel page the kernel is genuinely using, so what the hardware
+/// raises is a permission fault rather than a translation fault. Reading an unmapped address would
+/// fault too, and would prove nothing about privilege.
+extern "C" fn trespassing_thread(kernel_address: usize) {
+    // SAFETY: mapped EL0-executable alongside the other programs; stack slot 1 is its own.
+    unsafe {
+        user::enter(
+            user::trespasser(),
+            user::stack_top(1),
+            kernel_address as u64,
+            0,
+        )
+    }
+}
+
+/// The kernel half of the server: publishes an endpoint and waits on it.
+extern "C" fn server_thread(_arg: usize) {
+    let (console, registry) = seed_capabilities();
+    // SAFETY: mapped EL0-executable alongside the other programs; stack slot 2 is its own.
+    unsafe { user::enter(user::server(), user::stack_top(2), console, registry) }
+}
+
+/// The kernel half of the client: finds that endpoint by name and sends to it.
+extern "C" fn client_thread(_arg: usize) {
+    let (console, registry) = seed_capabilities();
+    // SAFETY: mapped EL0-executable alongside the other programs; stack slot 3 is its own.
+    unsafe { user::enter(user::client(), user::stack_top(3), console, registry) }
+}
+
+/// The kernel half of the shell.
+extern "C" fn shell_thread(_arg: usize) {
+    let (console, registry) = seed_capabilities();
+    let entry = arch::target::shell::main as *const () as u64;
+    // SAFETY: `shell::main` is linked into `.user_text`, which `mmu::init` mapped EL0-executable,
+    // and stack slot 0 belongs to this thread — the selftest programs that use it do not run here.
+    unsafe { user::enter(entry, user::stack_top(0), console, registry) }
+}
+
+/// Waits for a thread to retire and returns what it stopped with, failing the run if it never does.
+fn await_exit(id: u64, what: &str) -> u64 {
+    let mut spins = 0u64;
+    loop {
+        if let Some(code) = sched::exit_code_of(id) {
+            return code;
+        }
+        sched::yield_now();
+        spins += 1;
+        if spins > 5_000_000 {
+            println!("  [selftest] {what} never finished — FAILED");
+            sched::dump();
+            semihosting::exit(1);
+        }
+    }
+}
+
+/// Counters the selftest's worker threads advance, one each.
 /// Counters the selftest's worker threads advance, one each.
 static COUNTERS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 

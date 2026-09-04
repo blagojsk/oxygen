@@ -68,6 +68,10 @@ boot order, milestones, deferred decisions — lives in SPECS.md. Read it before
   explicitly asked.
 - CI configuration under `.github/workflows/` may be changed on the default branch directly.
 - This applies per request: a merge approved once does not authorise the next.
+- **A merge is not finished until the branch is gone and the issue is closed.** Delete the merged branch,
+  local and remote, in the same step as the merge, and close every issue the merge resolved with a comment
+  naming the pull request or commit. Merged branches only — a parked branch stays until its work lands. A
+  branch that outlives its merge gets built on by mistake; an issue that outlives its fix gets planned twice.
 
 # Commit messages
 

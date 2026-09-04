@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 oxygen-aarch64 = { path = "../crates/oxygen-aarch64" }
+oxygen-cap = { path = "../crates/oxygen-cap" }
+oxygen-ipc = { path = "../crates/oxygen-ipc" }
 oxygen-mem = { path = "../crates/oxygen-mem" }
 
 # There is no `test` crate on a freestanding target, so the default test and bench harnesses

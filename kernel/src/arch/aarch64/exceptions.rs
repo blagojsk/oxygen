@@ -212,6 +212,27 @@ fn describe(esr: u64) -> &'static str {
     }
 }
 
+/// Which kind of abort, for the aborts where the distinction is the whole point.
+///
+/// A permission fault means the mapping exists and refused the access; a translation fault means
+/// nothing was mapped there at all. Both stop the access, and only the first proves anything about
+/// privilege — so an assertion that a user thread was refused has to be able to tell them apart.
+fn fault_class(esr: u64) -> &'static str {
+    if !matches!(esr >> 26, 0b100000 | 0b100001 | 0b100100 | 0b100101) {
+        return "";
+    }
+    // DFSC/IFSC, the low six bits of ISS. The top four select the class, the low two the level
+    // of the walk that raised it.
+    let status = esr & 0x3F;
+    match status >> 2 {
+        0b0000 => " (address size fault)",
+        0b0001 => " (translation fault — nothing was mapped)",
+        0b0010 => " (access flag fault)",
+        0b0011 => " (permission fault — the mapping refused it)",
+        _ => "",
+    }
+}
+
 /// Reports a fault we have no policy for yet, then stops.
 ///
 /// Returning would resume the faulting instruction and fault again forever, so this deliberately
@@ -243,7 +264,6 @@ fatal_trap! {
     trap_serror_sp0    => "serror (SP0)",
     trap_fiq           => "fiq (kernel)",
     trap_serror        => "serror (kernel)",
-    trap_sync_lower    => "synchronous (user)",
     trap_fiq_lower     => "fiq (user)",
     trap_serror_lower  => "serror (user)",
     trap_sync_lower32  => "synchronous (aarch32)",
@@ -280,6 +300,46 @@ extern "C" fn trap_irq(_frame: &mut TrapFrame) {
     if crate::sched::reschedule_requested() {
         crate::sched::yield_now();
     }
+}
+
+/// Synchronous exception from EL0 — a system call, or a user thread doing something it may not.
+///
+/// This is the only trap in the kernel that is routinely *expected*. It returns rather than
+/// panicking, and the value it leaves in the frame's `x0` is what userspace sees come back out of
+/// its `svc`.
+#[unsafe(no_mangle)]
+extern "C" fn trap_sync_lower(frame: &mut TrapFrame) {
+    /// Exception class for an `SVC` executed in AArch64 state.
+    const EC_SVC64: u64 = 0b010101;
+
+    if frame.esr >> 26 == EC_SVC64 {
+        let args = [
+            frame.x[0], frame.x[1], frame.x[2], frame.x[3], frame.x[4], frame.x[5],
+        ];
+        // The number is in x8, following the AArch64 Linux convention. ELR already points at the
+        // instruction after the SVC — the hardware advances it — so there is nothing to adjust.
+        frame.x[0] = crate::syscall::dispatch(frame.x[8], args);
+        return;
+    }
+
+    user_fault(frame)
+}
+
+/// A user thread did something the hardware refused.
+///
+/// It kills the thread and nothing else. That is the entire point of having spent M4 on a
+/// privilege boundary: before it, every fault was fatal to the machine, because every fault was
+/// the kernel's. Now a user program can be wrong on its own.
+fn user_fault(frame: &TrapFrame) -> ! {
+    println!();
+    println!(
+        "  [trap] user fault: {}{}",
+        describe(frame.esr),
+        fault_class(frame.esr)
+    );
+    println!("  [trap] elr {:#018x}  far {:#018x}", frame.elr, frame.far);
+    println!("  [trap] the thread is retired; the kernel is not affected");
+    crate::sched::retire_current(crate::sched::EXIT_FAULTED)
 }
 
 /// IRQ taken while userspace was running. Same handling for now; it diverges once there are

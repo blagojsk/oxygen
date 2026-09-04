@@ -14,6 +14,8 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use oxygen_cap::CapSpace;
+
 use crate::arch::target::context::{self, Context};
 use crate::sync::SpinLock;
 
@@ -21,10 +23,34 @@ use crate::sync::SpinLock;
 /// nesting this kernel permits, small enough that a hundred threads cost under two megabytes.
 const STACK_SIZE: usize = 16 * 1024;
 
+/// Capability slots per thread.
+///
+/// Fixed rather than growable, and small on purpose: a capability space that can grow without
+/// bound is a way for one task to consume the kernel's memory, and a task that genuinely needs
+/// hundreds of capabilities is describing a design problem rather than a sizing one.
+pub const CAP_SLOTS: usize = 16;
+
+/// The wait channel a thread parks on while waiting for console input.
+///
+/// Zero, which endpoint ids deliberately never use — they start at 1. A wait channel is any number
+/// two parties agree on; endpoints name themselves and the console gets the one value left over,
+/// so the two can never collide without somebody having changed that on purpose.
+pub const WAIT_CONSOLE: u64 = 0;
+
+/// Exit code reported for a thread the hardware stopped, as opposed to one that chose to exit.
+/// Distinct from any syscall error so the two can never be confused for one another.
+pub const EXIT_FAULTED: u64 = u64::MAX - 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     /// Runnable or running — the scheduler makes no distinction while there is one core.
     Ready,
+    /// Waiting for something to arrive on the endpoint with this id.
+    ///
+    /// A blocked thread is skipped by the scheduler entirely, which is the difference between
+    /// waiting and polling: a thread that spins on an empty queue costs exactly as much CPU as one
+    /// doing work, and on the machines this OS targets that is the whole budget.
+    Blocked(u64),
     /// Returned from its entry point. Kept in the table so its id stays meaningful.
     Finished,
 }
@@ -34,6 +60,16 @@ pub struct Thread {
     pub name: &'static str,
     pub state: State,
     context: Context,
+    /// What it stopped with, once it has stopped.
+    ///
+    /// Per thread rather than one global slot: with more than one thread retiring, a single slot
+    /// records whichever finished last, and a test that means to assert on a particular thread
+    /// ends up asserting on a race.
+    exit: Option<u64>,
+    /// Everything this thread is allowed to do. Empty at birth: a thread is born with no
+    /// authority at all and receives it explicitly, which is the only arrangement in which
+    /// "what can this agent do?" has an answer you can actually read.
+    caps: CapSpace<CAP_SLOTS>,
     /// Owned so it is freed when the thread is reaped. Never read directly — the context's stack
     /// pointer is what actually matters — but dropping it while the thread lives would hand its
     /// stack to somebody else.
@@ -63,6 +99,8 @@ pub fn init() {
         name: "boot",
         state: State::Ready,
         context: Context::default(),
+        exit: None,
+        caps: CapSpace::new(),
         _stack: None,
     };
     *SCHEDULER.lock() = Some(Scheduler {
@@ -83,6 +121,8 @@ pub fn spawn(name: &'static str, entry: extern "C" fn(usize), arg: usize) -> u64
         name,
         state: State::Ready,
         context: Context::for_new_thread(entry, arg, stack_top),
+        exit: None,
+        caps: CapSpace::new(),
         _stack: Some(stack),
     };
 
@@ -158,16 +198,101 @@ fn next_ready(s: &Scheduler) -> Option<usize> {
 /// Retires the running thread. Reached when a thread's entry point returns.
 #[unsafe(no_mangle)]
 extern "C" fn thread_exit() -> ! {
+    retire_current(0)
+}
+
+/// Stops the running thread for good and records why.
+///
+/// Does not return, and cannot: it is called from inside a syscall or a fault, where the trap
+/// frame below belongs to a thread that must never resume. The thread stays in the table rather
+/// than being removed — its id keeps meaning something, and its stack is not handed to anyone
+/// while a frame on it is still live.
+pub fn retire_current(code: u64) -> ! {
     {
         let mut guard = SCHEDULER.lock();
         if let Some(s) = guard.as_mut() {
-            s.threads[s.current].state = State::Finished;
+            let current = s.current;
+            s.threads[current].exit = Some(code);
+            s.threads[current].state = State::Finished;
         }
     }
     loop {
         yield_now();
         core::hint::spin_loop();
     }
+}
+
+/// What the thread with this id stopped with, or `None` while it is still running.
+pub fn exit_code_of(id: u64) -> Option<u64> {
+    let guard = SCHEDULER.lock();
+    let s = guard.as_ref()?;
+    s.threads.iter().find(|t| t.id == id)?.exit
+}
+
+/// Parks the running thread until something arrives on `endpoint`.
+///
+/// The loop is not decoration. `yield_now` returns immediately when there is nothing else to run,
+/// so without re-checking, a thread that blocked while it was the only runnable one would carry on
+/// executing as though it had never blocked. When there is genuinely nothing to do, waiting for an
+/// interrupt is what lets the CPU idle instead of spinning — the timer will always wake it.
+pub fn block_current_on(endpoint: u64) {
+    {
+        let mut guard = SCHEDULER.lock();
+        if let Some(s) = guard.as_mut() {
+            let current = s.current;
+            s.threads[current].state = State::Blocked(endpoint);
+        }
+    }
+    loop {
+        yield_now();
+        {
+            let guard = SCHEDULER.lock();
+            let Some(s) = guard.as_ref() else { return };
+            if s.threads[s.current].state == State::Ready {
+                return;
+            }
+        }
+        crate::arch::target::wait_for_interrupt_once();
+    }
+}
+
+/// Makes every thread waiting on `endpoint` runnable again. Returns how many were woken.
+///
+/// Wakes all of them rather than one, and lets them race for the queue: picking a winner here
+/// would be a scheduling policy hidden inside the IPC path, and a thread that loses the race finds
+/// the queue empty and blocks again, which is correct without anything having to coordinate.
+pub fn wake_all_on(endpoint: u64) -> usize {
+    let mut guard = SCHEDULER.lock();
+    let Some(s) = guard.as_mut() else { return 0 };
+    let mut woken = 0;
+    for thread in s.threads.iter_mut() {
+        if thread.state == State::Blocked(endpoint) {
+            thread.state = State::Ready;
+            woken += 1;
+        }
+    }
+    woken
+}
+
+/// What the thread with this id is doing, if it exists.
+pub fn state_of(id: u64) -> Option<State> {
+    let guard = SCHEDULER.lock();
+    let s = guard.as_ref()?;
+    s.threads.iter().find(|t| t.id == id).map(|t| t.state)
+}
+
+/// Runs `f` against the capability space of the thread currently on the CPU.
+///
+/// Scoped rather than handing out a reference because the space lives inside the thread table,
+/// behind the scheduler's lock. The closure must not switch threads — nothing it is given the
+/// means to do can.
+pub fn with_caps<R>(f: impl FnOnce(&mut CapSpace<CAP_SLOTS>) -> R) -> R {
+    let mut guard = SCHEDULER.lock();
+    let s = guard
+        .as_mut()
+        .expect("capability access before the scheduler was initialised");
+    let current = s.current;
+    f(&mut s.threads[current].caps)
 }
 
 /// How many threads exist, and how many of those are still runnable.
@@ -190,10 +315,18 @@ pub fn dump() {
     let Some(s) = guard.as_ref() else { return };
     for (i, t) in s.threads.iter().enumerate() {
         let marker = if i == s.current { '>' } else { ' ' };
-        let state = match t.state {
-            State::Ready => "ready",
-            State::Finished => "finished",
-        };
-        crate::println!("  [sched] {marker} #{} {:<10} {}", t.id, t.name, state);
+        match t.state {
+            State::Ready => crate::println!("  [sched] {marker} #{} {:<12} ready", t.id, t.name),
+            State::Blocked(on) => {
+                crate::println!(
+                    "  [sched] {marker} #{} {:<12} blocked on endpoint {on}",
+                    t.id,
+                    t.name
+                )
+            }
+            State::Finished => {
+                crate::println!("  [sched] {marker} #{} {:<12} finished", t.id, t.name)
+            }
+        }
     }
 }
