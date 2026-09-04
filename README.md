@@ -72,4 +72,9 @@ capabilities become unforgeable handles and the IPC surface becomes typed and in
 
 ## Licence
 
-MIT OR Apache-2.0.
+Dual licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option — the Rust
+ecosystem's convention. Apache-2.0 is here for its express patent grant, which matters more for an
+operating system than for most software; MIT is here because it is short enough that people
+actually read it.
+
+Contributions are accepted under the same dual licence.
