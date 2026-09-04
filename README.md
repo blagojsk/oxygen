@@ -10,8 +10,9 @@ agents have to scrape and guess at, and as rigid ABIs that nothing can discover 
 starts from the opposite premise — a capability is one typed, self-describing thing, rendered for
 whoever is asking.
 
-**Status: milestone 1.** It boots on bare metal, routes its own exceptions, and takes timer
-interrupts. It cannot yet manage memory, run a thread, or hold a conversation.
+**Status: milestone 3.** It boots on bare metal, routes its own exceptions, takes timer interrupts,
+maps itself with page tables that refuse a write to its own code, allocates from a kernel heap, and
+preempts between threads. It cannot yet run a line of user code, so it cannot yet hold a conversation.
 
 ## Starting it
 
@@ -59,11 +60,11 @@ modules so that port is additive rather than a rewrite.
 | --- | --- | --- |
 | M0 | Boots, reaches Rust, serial output, panic handling | **done** |
 | M1 | Exception vectors, GIC, timer interrupt, physical frame allocator | **done** |
-| M2 | MMU, page tables, kernel heap | next |
-| M3 | Threads and a scheduler | |
-| M4 | User mode, syscalls, capability handles | |
+| M2 | MMU, per-section mapping with W^X, kernel heap | **done** |
+| M3 | Threads, context switch, preemptive scheduler | **done** |
+| M4 | User mode, syscalls, capability handles | next |
 | M5 | Typed IPC and the capability registry | |
-| M6 | Userspace services — console, storage | |
+| M6 | Userspace services — console, shell | |
 | M7 | Agent surface: schema discovery, audit journal | |
 
 M0–M3 is conventional kernel work that any OS needs. The thesis starts paying off at M4–M5, where
