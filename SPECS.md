@@ -61,12 +61,16 @@ A Cargo workspace. Everything freestanding.
 | `kernel/linker.ld` | memory layout; `build.rs` passes it to the linker |
 | `kernel/src/syscall.rs` | the system call surface — everything EL0 can ask for |
 | `kernel/src/ipc.rs` | endpoints, blocking, and the name registry |
+| `kernel/src/audit.rs` | the audit journal: the one static instance, and who is calling |
+| `kernel/src/schema.rs` | the schema table: what each object kind's capability lets you call |
 | `kernel/src/arch/aarch64/shell.rs` | the shell — Rust compiled into the EL0 section |
 | `kernel/src/arch/aarch64/user.rs` | entering EL0, and the test programs that run there |
 | `crates/oxygen-mem/` | portable memory logic: addresses, frame allocator, heap |
 | `crates/oxygen-aarch64/` | AArch64 encodings that are pure arithmetic |
 | `crates/oxygen-cap/` | portable capability logic: handles, rights, derivation, revocation |
 | `crates/oxygen-ipc/` | portable message, queue and registry logic |
+| `crates/oxygen-schema/` | portable schema logic: methods, interfaces, and their wire encoding |
+| `crates/oxygen-audit/` | portable audit journal logic: a fixed-capacity ring, and its wire encoding |
 | `scripts/` | developer and CI entry points |
 | `scripts/check-userspace.sh` | asserts no EL0 code branches into the kernel |
 | `.cargo/config.toml` | default target and the QEMU runner |
@@ -110,9 +114,10 @@ fixed order, and the order is the load-bearing fact.*
 | 6 | Brings up the GIC distributor and CPU interface | `arch/aarch64/gic.rs` |
 | 7 | Starts the generic timer | `arch/aarch64/timer.rs` |
 | 8 | Creates the endpoint table and the name registry | `ipc.rs` |
-| 9 | Enables UART receive interrupts | `arch/aarch64/uart.rs` |
-| 10 | Gives the user stacks their EL0 permissions | `arch/aarch64/user.rs` |
-| 11 | Unmasks IRQs | `arch/aarch64/mod.rs` |
+| 9 | Builds the schema table: what each object kind's capability can call | `schema.rs` |
+| 10 | Enables UART receive interrupts | `arch/aarch64/uart.rs` |
+| 11 | Gives the user stacks their EL0 permissions | `arch/aarch64/user.rs` |
+| 12 | Unmasks IRQs | `arch/aarch64/mod.rs` |
 
 Order is load-bearing: vectors before any interrupt can be delivered, the MMU before the GIC whose registers
 are reached through the device mapping, the scheduler before the first timer tick asks for a reschedule.
@@ -170,7 +175,7 @@ with a readable answer rather than an audit of every code path it might take.
 | --- | --- |
 | Handle | `(index, generation)` packed into a `u64`. The generation is what makes a withdrawn handle fail rather than silently naming whatever reused its slot |
 | Rights | `READ`, `WRITE`, `GRANT`, `REVOKE`. Never widen on delegation — a derived capability gets the intersection of what was asked for and what the parent held |
-| Objects | `Console`, `Task`, `Memory`, and `Null` for a free slot |
+| Objects | `Console`, `Task`, `Memory`, `Endpoint` (`WRITE` sends, `READ` receives), `Registry` (discovery is itself an authority), `Journal` (reading what the system did is not ambient), and `Null` for a free slot |
 | Space | Fixed at 16 slots per thread. Growable spaces let one task consume the kernel's memory |
 | Derivation | Each slot carries `parent`, `first_child`, `next_sibling` as `u32` indices — 16 bytes, and the table stays relocatable |
 
@@ -207,6 +212,8 @@ it and it was withdrawn" is what a caller needs in order to react.
 | `SYS_READ` | `(handle, ptr, cap) -> bytes read` — requires `READ` on a console; blocks |
 | `SYS_SERVICES` | `(registry, index, ptr, cap) -> len` — the name published at an index |
 | `SYS_UPTIME` | `() -> timer ticks since boot` |
+| `SYS_DESCRIBE` | `(handle, index, ptr, cap) -> bytes written` — the `index`th method of whatever `handle` names, on the wire. Needs no particular right |
+| `SYS_AUDIT` | `(journal, index, ptr, cap) -> bytes written` — the `index`th retained audit event, oldest first, on the wire. Requires `READ` on a `Journal` |
 
 Every pointer argument is checked against the calling thread's own pages before the kernel dereferences it.
 Without that check a handle with entirely legitimate rights becomes a way to print kernel memory.
@@ -276,6 +283,54 @@ end wants to see what it typed, and an agent driving this over a pipe does not.
 | `services` | enumerates the registry — what is published, discovered rather than known in advance |
 | `uptime` | timer ticks since boot |
 | `echo ...` | hands the rest of the line back |
+| `describe` | the console's own methods; `describe <name>` looks the name up first and describes what it resolves to |
+| `audit` | every retained audit event, oldest first |
+
+## Agent surface
+
+The design thesis's two remaining invariants — discoverable and auditable — need one more surface
+each: a way to ask what a capability can do, and a way to read back what already happened. Both
+are typed data rather than prose, for the same reason a message and a registry entry already are:
+the identical bytes render as a help listing for a person and a tool definition for an agent, so
+there is one contract instead of a human-facing one and a machine-facing one that can drift apart.
+
+**`SYS_DESCRIBE`** answers "what can I do with this handle?" by returning one method at a time,
+encoded on the wire (`oxygen_schema::Method`, `crates/oxygen-schema/`): its name, its argument and
+return kinds, and — this is the point — an id that *is* the syscall number to invoke it with. A
+caller that has never read this source still knows exactly what to put in `x8`. Every object kind
+with methods (console, endpoint, registry, journal) also exposes the four generic ones —
+`identify`, `delegate`, `revoke`, `describe` itself — because those apply to any capability
+regardless of what it names, and a holder must be able to discover them from the handle alone.
+`describe` needs no particular right: what a capability can do must not itself be gated behind one
+of the rights it describes, or a capability narrowed down far enough would also be one whose own
+methods could no longer be listed.
+
+**`SYS_AUDIT`** answers "what has this system done?" by returning one retained event at a time
+(`oxygen_audit::Event`, `crates/oxygen-audit/`), also fixed-width on the wire: who acted, what
+action, on what kind of object, with what rights, and one extra field the action needs (a new
+handle, a count, the syscall a refusal belongs to). Reading it requires `READ` on a `Journal`
+capability — discoverability of *behaviour* is exactly as much an authority as discoverability of
+*services* already was for the registry.
+
+**Every refusal is journaled, not just every grant.** `write`, `read`, `send`, `recv`, `delegate`,
+`revoke`, `lookup`, `register`, `services` and `audit` itself all record a `Denied` event when they
+turn a caller away for lacking a right, naming the object's kind, the rights the caller actually
+held, and which syscall it tried. Without this half, the journal would be a log of successes — a
+human or an agent reading it back could see everything an actor was ever *allowed*, and nothing it
+was ever *refused*, which is the half of an audit trail that "was this agent operating within its
+authority?" actually needs answered.
+
+The journal itself is a 64-event ring (`kernel/src/audit.rs`) — 2 KiB, cheap enough against the
+2 MiB kernel heap to keep resident always rather than trimmed further, and deep enough to outlast
+a shell session's worth of exploration without wrapping mid-demonstration. Once it does wrap,
+truncation is not silent: every eviction increments a counter a reader can compare against what it
+last saw, so a ring that has lost history is distinguishable from one that has not, rather than
+quietly looking complete either way.
+
+The journal capability every thread is seeded with carries `READ` only. Nothing but the kernel
+itself ever calls `audit::record` — no syscall hands a user thread a way to write an event
+directly — so `WRITE` on it would be authority with nothing to do, and granting it anyway would
+only be a way to eventually widen it by mistake.
 
 ## Scheduling
 
@@ -325,9 +380,15 @@ No CI, no versioning scheme and no deploy target exist. Version is `0.0.1` in th
 | Host unit | `crates/*/src`, under `#[cfg(test)]` | host triple | 39 |
 | Boot assertions | `kernel/src/main.rs`, gated by `OXYGEN_SELFTEST` | QEMU, TCG | 5 |
 
-Boot assertions each assert an observable behaviour rather than the absence of a crash: translation is on and
-execution continues, the timer tick count rises, three threads interleave, the heap allocates and returns to
-its prior usage, and a write to `.text` is refused by the hardware.
+Boot assertions each assert an observable behaviour rather than the absence of a crash: the MMU is on, the
+timer tick count rises, three threads interleave, the heap allocates, sums and frees back to the prior usage,
+EL0 writes through a capability, delegates it, revokes it, and the revoked handle fails with a stale-handle
+error specifically; an EL0 read of kernel memory is a permission fault that kills the thread and not the
+kernel; a server is observed blocked off the run queue before a client is spawned, a typed payload crosses
+intact, and an unpublished name is not found; the journal's sequence numbers are strictly increasing, the
+delegate-then-revoke is attributed to the right thread, a lookup-obtained handle's attempt to re-register is
+recorded as a refusal, and the console's schema round-trips the wire; and last, because it ends the run, a
+write to `.text` is refused.
 
 ## Milestones
 
@@ -340,7 +401,7 @@ its prior usage, and a write to `.text` is refused by the hardware.
 | M4 | User mode, syscalls, capability handles | done |
 | M5 | Typed IPC and the capability registry | done |
 | M6 | Userspace services — console, shell | done |
-| M7 | Agent surface: schema discovery, audit journal | next |
+| M7 | Agent surface: schema discovery, audit journal | done |
 
 M0–M3 was conventional kernel work. M4–M6 are where the thesis starts paying: authority is a handle the
 kernel checks rather than a permission the caller happens to have, it can be taken back, and what those
@@ -441,25 +502,37 @@ holds.
 - **Why it waits.** The boot assertions cover the current surface.
 - **Prerequisites (owner).** Reopens when a test needs hardware semantics that host arithmetic cannot model.
 
-**12. Hardware-accelerated test harness — CUT**
+**12. Journal persistence — PARKED**
+
+- **What.** Writing audit events somewhere that survives a reboot, instead of the in-memory ring `kernel/src/audit.rs` keeps today.
+- **Why it waits.** There is no storage driver, so nothing exists yet for the journal to persist to. RAM-only is not incorrect — everything the journal has ever recorded is genuinely lost at reboot — only incomplete for a record meant to outlive the machine that made it.
+- **Prerequisites (owner).** Reopens with entry 7 above (loading a program from storage): the first storage driver is what makes a durable journal possible.
+
+**13. Schemas for message interfaces — PARKED**
+
+- **What.** Letting a service describe what its own message interface speaks — the argument shapes and methods behind an `oxygen_ipc::Message`'s `interface` field — the same way `kernel/src/schema.rs` lets an object kind describe its methods today.
+- **Why it waits.** M7 describes *object* interfaces only (`console`, `endpoint`, `registry`, `journal` — ids 1–4, one per capability kind). A message's `interface` field is a separate, unrelated numbering chosen freely by whatever service is listening on an endpoint (the M5 echo test sends interface `7`), and nothing here registers or reads it.
+- **Prerequisites (owner).** Reopens when a service wants to publish what it speaks over an endpoint, rather than that protocol being known only to whoever wrote both ends.
+
+**14. Hardware-accelerated test harness — CUT**
 
 - **What.** Running the automated boot test under HVF rather than TCG.
 - **Why.** HVF does not intercept the semihosting trap, so the exit code the harness depends on is lost. The
   kernel boots correctly under HVF, so `scripts/run.sh --accel` uses it for running; testing stays on TCG.
 
-**13. Buddy or size-class frame allocator — CUT**
+**15. Buddy or size-class frame allocator — CUT**
 
 - **What.** Replacing the bitmap with an allocator that serves large contiguous requests faster.
 - **Why.** Both keep per-block structures resident whether or not anything is allocated. The bitmap's flat
   cost of one bit per frame is the correct trade for the target hardware.
 
-**14. Saving the full register set on context switch — CUT**
+**16. Saving the full register set on context switch — CUT**
 
 - **What.** Preserving `x0`–`x18` in `Context` alongside the callee-saved registers.
 - **Why.** The procedure call standard already permits a function to destroy them, so the caller has
   preserved anything it needs. A preempted thread's full state is in its trap frame regardless.
 
-**15. Docker as a way to run Oxygen — CUT**
+**17. Docker as a way to run Oxygen — CUT**
 
 - **What.** Shipping a container image that boots the OS.
 - **Why.** A container shares the host kernel, so it cannot boot one of its own. Running an OS needs a

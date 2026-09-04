@@ -201,6 +201,18 @@ __user_client_start:
     mov     x8, #{sys_send}
     svc     #0
 
+    // Prove that a name found by lookup cannot be re-advertised by the finder: x20 is the
+    // capability SYS_LOOKUP handed back, which carries READ|WRITE but never GRANT, so publishing
+    // it under a new name must be refused with E_RIGHTS. This program does not branch on the
+    // result — the selftest asserts on the audit journal instead, which is the record that has
+    // to exist whether or not the caller here bothers to check.
+    mov     x0, x21
+    adr     x1, 38f
+    mov     x2, #5
+    mov     x3, x20
+    mov     x8, #{sys_register}
+    svc     #0
+
     mov     x0, xzr
     mov     x8, #{sys_exit}
     svc     #0
@@ -209,6 +221,7 @@ __user_client_start:
 31:
 34: .ascii  "echo"
 36: .byte   42
+38: .ascii  "echo2"
 .balign 4
 .global __user_client_end
 __user_client_end:
@@ -316,10 +329,14 @@ fn within(ptr: u64, len: u64, page_base: u64) -> bool {
 
 /// Leaves EL1 for EL0 and does not come back — the way back is a trap.
 ///
+/// Three arguments cross in `x0`–`x2`: the assembly test programs only ever read the first two
+/// and ignore `x2`, but the shell is a fourth caller of this same entry path and needs a third
+/// capability, so the slot exists on every call rather than being bolted on for one of them.
+///
 /// # Safety
 /// `entry` must be a mapped, EL0-executable address and `stack_top` a mapped, EL0-writable one.
 /// Both are what [`load`] returns.
-pub unsafe fn enter(entry: u64, stack_top: u64, arg0: u64, arg1: u64) -> ! {
+pub unsafe fn enter(entry: u64, stack_top: u64, arg0: u64, arg1: u64, arg2: u64) -> ! {
     // SAFETY: SPSR of zero selects EL0t with DAIF clear. Clear on purpose: masking interrupts on
     // the way down would make a user thread unpreemptable, and a single spinning user program
     // would take the machine with it.
@@ -334,6 +351,7 @@ pub unsafe fn enter(entry: u64, stack_top: u64, arg0: u64, arg1: u64) -> ! {
             entry = in(reg) entry,
             in("x0") arg0,
             in("x1") arg1,
+            in("x2") arg2,
             options(noreturn),
         )
     }

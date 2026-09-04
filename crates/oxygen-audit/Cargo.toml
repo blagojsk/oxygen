@@ -1,0 +1,8 @@
+[package]
+name = "oxygen-audit"
+description = "Portable audit journal logic: a fixed-capacity event ring with a stable wire encoding"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

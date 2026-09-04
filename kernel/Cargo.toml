@@ -7,9 +7,11 @@ license.workspace = true
 
 [dependencies]
 oxygen-aarch64 = { path = "../crates/oxygen-aarch64" }
+oxygen-audit = { path = "../crates/oxygen-audit" }
 oxygen-cap = { path = "../crates/oxygen-cap" }
 oxygen-ipc = { path = "../crates/oxygen-ipc" }
 oxygen-mem = { path = "../crates/oxygen-mem" }
+oxygen-schema = { path = "../crates/oxygen-schema" }
 
 # There is no `test` crate on a freestanding target, so the default test and bench harnesses
 # cannot link. Disabling them keeps `--all-targets` usable for lints instead of erroring out;

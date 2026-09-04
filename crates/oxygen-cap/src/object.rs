@@ -20,4 +20,9 @@ pub enum Object {
     /// The name registry. Holding this is what lets a task ask what exists by name, so that
     /// discovery is itself an authority somebody granted rather than something every task has.
     Registry,
+    /// The audit journal. Holding this is what lets a task read what the system has done —
+    /// every grant, delegation, revocation and refusal — so reading that record is itself an
+    /// authority somebody granted, the same as reading the registry is, rather than something
+    /// ambient any task could do simply by existing.
+    Journal,
 }
