@@ -18,8 +18,9 @@ mod arch;
 mod mm;
 mod sched;
 mod sync;
+mod syscall;
 
-use arch::target::{self, exceptions, gic, mmu, semihosting, timer};
+use arch::target::{self, exceptions, gic, mmu, semihosting, timer, user};
 
 /// Set by the harness when the kernel is booted as a test rather than for a human to watch.
 const SELFTEST: bool = option_env!("OXYGEN_SELFTEST").is_some();
@@ -53,6 +54,9 @@ pub extern "C" fn kernel_main() -> ! {
         sched::init();
         gic::init();
         timer::init();
+        // After the MMU, which it needs in order to narrow a page's permissions, and before any
+        // thread can be entered into it.
+        user::load();
         target::enable_irqs();
     }
     println!("  [boot] interrupts enabled");
@@ -165,6 +169,74 @@ fn selftest() -> ! {
         );
     }
 
+    // Prove the privilege boundary exists and that capabilities are what crosses it. The user
+    // program runs at EL0, writes through a capability, derives a narrower one, revokes it, and
+    // reports back what the kernel refused the revoked handle with. Asserting on *which* refusal
+    // is the point: any error would prove the write failed, but only this one proves it failed
+    // because the grant was withdrawn.
+    {
+        sched::spawn("user", user_thread, 0);
+
+        let mut spins = 0u64;
+        while sched::exit_code().is_none() {
+            sched::yield_now();
+            spins += 1;
+            if spins > 5_000_000 {
+                println!("  [selftest] the user thread never returned — FAILED");
+                sched::dump();
+                semihosting::exit(1);
+            }
+        }
+
+        match sched::exit_code() {
+            Some(syscall::E_STALE) => println!(
+                "  [selftest] EL0 wrote through a capability, then lost it to revocation — ok"
+            ),
+            Some(sched::EXIT_FAULTED) => {
+                println!("  [selftest] the user thread faulted instead of exiting — FAILED");
+                semihosting::exit(1);
+            }
+            other => {
+                println!(
+                    "  [selftest] user thread exited with {other:?}, expected a stale handle — FAILED"
+                );
+                semihosting::exit(1);
+            }
+        }
+    }
+
+    // The boundary itself. A user thread that reads kernel memory must die, and the kernel must
+    // not. Every fault before M4 was fatal to the machine because every fault was the kernel's;
+    // this asserts that is no longer true, which is the whole return on having a privilege level.
+    {
+        sched::clear_exit();
+        sched::spawn(
+            "trespasser",
+            trespassing_thread,
+            mmu::text_address() as usize,
+        );
+
+        let mut spins = 0u64;
+        while sched::exit_code().is_none() {
+            sched::yield_now();
+            spins += 1;
+            if spins > 5_000_000 {
+                println!("  [selftest] the trespassing thread never stopped — FAILED");
+                semihosting::exit(1);
+            }
+        }
+
+        match sched::exit_code() {
+            Some(sched::EXIT_FAULTED) => {
+                println!("  [selftest] EL0 read of kernel memory faulted, kernel survived — ok")
+            }
+            other => {
+                println!("  [selftest] EL0 read kernel memory and exited {other:?} — FAILED");
+                semihosting::exit(1);
+            }
+        }
+    }
+
     // Last, because it ends the run: prove W^X is enforced rather than merely configured.
     // Reading the descriptors back would only confirm we wrote what we meant to; the hardware
     // refusing the write is the actual guarantee. The fault handler recognises this one and exits
@@ -177,6 +249,36 @@ fn selftest() -> ! {
 
     println!("  [selftest] write to .text SUCCEEDED — W^X is NOT enforced — FAILED");
     semihosting::exit(1)
+}
+
+/// The kernel half of the first user thread.
+///
+/// It runs at EL1 just long enough to give itself the one capability the program will be born
+/// holding, and then leaves for EL0 and does not come back. Seeding the capability here rather
+/// than at spawn time is deliberate: authority is granted to a thread by name, in code you can
+/// point at, rather than appearing as a property of having been created.
+extern "C" fn user_thread(_arg: usize) {
+    use oxygen_cap::{Object, Rights};
+
+    let handle = sched::with_caps(|caps| caps.insert(Object::Console, Rights::ALL))
+        .expect("a fresh capability space has room for one capability");
+
+    let (entry, stack_top) = user::program();
+    // SAFETY: `entry` and `stack_top` are what the loader prepared and mapped for EL0 during boot,
+    // and no other thread has been entered into them.
+    unsafe { user::enter(entry, stack_top, handle.raw()) }
+}
+
+/// A user thread that reads where it may not, so the refusal can be observed.
+///
+/// The address it is given is a kernel page the kernel is genuinely using, so what the hardware
+/// raises is a permission fault rather than a translation fault. Reading an unmapped address would
+/// fault too, and would prove nothing about privilege.
+extern "C" fn trespassing_thread(kernel_address: usize) {
+    let (entry, stack_top) = user::trespasser();
+    // SAFETY: the loader mapped this entry EL0-executable alongside the first program, and the
+    // thread it retires is this one.
+    unsafe { user::enter(entry, stack_top, kernel_address as u64) }
 }
 
 /// Counters the selftest's worker threads advance, one each.

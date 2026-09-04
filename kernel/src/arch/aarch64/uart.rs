@@ -39,6 +39,21 @@ impl Write for Uart {
     }
 }
 
+/// Writes raw bytes, without assuming they are text.
+///
+/// What arrives from a syscall is whatever userspace put in the buffer. Refusing a byte for not
+/// being valid UTF-8 would be the kernel imposing an encoding on a device that has none, so this
+/// deliberately takes bytes where the rest of the kernel takes `str`.
+pub fn write_bytes(bytes: &[u8]) {
+    let mut uart = Uart;
+    for &byte in bytes {
+        if byte == b'\n' {
+            uart.put(b'\r');
+        }
+        uart.put(byte);
+    }
+}
+
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     let _ = Uart.write_fmt(args);

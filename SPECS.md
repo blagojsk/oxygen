@@ -59,8 +59,10 @@ A Cargo workspace. Everything freestanding.
 | `kernel/` | the kernel binary: boot, exceptions, memory, scheduling |
 | `kernel/src/arch/aarch64/` | everything that knows about a specific CPU or interrupt controller |
 | `kernel/linker.ld` | memory layout; `build.rs` passes it to the linker |
+| `kernel/src/syscall.rs` | the system call surface — everything EL0 can ask for |
 | `crates/oxygen-mem/` | portable memory logic: addresses, frame allocator, heap |
 | `crates/oxygen-aarch64/` | AArch64 encodings that are pure arithmetic |
+| `crates/oxygen-cap/` | portable capability logic: handles, rights, derivation, revocation |
 | `scripts/` | developer and CI entry points |
 | `.cargo/config.toml` | default target and the QEMU runner |
 | `rust-toolchain.toml` | pinned compiler, components and target |
@@ -102,7 +104,8 @@ fixed order, and the order is the load-bearing fact.*
 | 5 | Adopts the running code as thread 0 | `sched.rs` |
 | 6 | Brings up the GIC distributor and CPU interface | `arch/aarch64/gic.rs` |
 | 7 | Starts the generic timer | `arch/aarch64/timer.rs` |
-| 8 | Unmasks IRQs | `arch/aarch64/mod.rs` |
+| 8 | Loads the user programs into a page and narrows it to EL0 read-execute | `arch/aarch64/user.rs` |
+| 9 | Unmasks IRQs | `arch/aarch64/mod.rs` |
 
 Order is load-bearing: vectors before any interrupt can be delivered, the MMU before the GIC whose registers
 are reached through the device mapping, the scheduler before the first timer tick asks for a reschedule.
@@ -129,6 +132,8 @@ Within the kernel image, one page at a time:
 | `.text` | read-only, executable at EL1 |
 | `.rodata` | read-only, never executable |
 | `.data`, `.bss`, page tables, boot stack | read/write, never executable |
+| user text page | read-only at EL0 and EL1, executable at EL0 only |
+| user stack page | read/write at EL0 and EL1, never executable |
 | remainder of the first 2 MiB | read/write, never executable |
 
 Fixed sizes: boot stack 64 KiB, per-thread kernel stack 16 KiB, kernel heap 2 MiB (512 frames), frame
@@ -147,6 +152,49 @@ permits coalescing.
 
 RAM extent is assumed at 128 MiB rather than discovered, and deliberately assumed below the 256 MiB the run
 scripts provide.
+
+## Capabilities and user mode
+
+A thread below EL1 holds no ambient authority. It cannot reach the console, or anything else, except by
+presenting a handle the kernel checks — which is what makes "what is this agent allowed to do?" a question
+with a readable answer rather than an audit of every code path it might take.
+
+| | |
+| --- | --- |
+| Handle | `(index, generation)` packed into a `u64`. The generation is what makes a withdrawn handle fail rather than silently naming whatever reused its slot |
+| Rights | `READ`, `WRITE`, `GRANT`, `REVOKE`. Never widen on delegation — a derived capability gets the intersection of what was asked for and what the parent held |
+| Objects | `Console`, `Task`, `Memory`, and `Null` for a free slot |
+| Space | Fixed at 16 slots per thread. Growable spaces let one task consume the kernel's memory |
+| Derivation | Each slot carries `parent`, `first_child`, `next_sibling` as `u32` indices — 16 bytes, and the table stays relocatable |
+
+**Revocation is supported, and that decision is why the derivation tree exists.** An approval *is* a
+capability grant, so a capability that cannot be withdrawn is an approval that cannot be withdrawn, which is
+not an approval. Generation counters alone would have been cheaper but revoke for every holder at once; the
+case that matters is withdrawing what was given to one agent, which is per-edge and needs the tree. The cost
+is 16 bytes per delegated capability — 4,096 live delegations is 64 KiB, against a target machine measured
+in tens of megabytes.
+
+`revoke` frees every descendant of a slot and leaves the slot itself intact: you withdraw what you gave, not
+what you hold. `delete` frees the slot and its subtree together, so no descendant outlives the authority it
+came from. Both walk the tree iteratively — recursion on a 16 KiB kernel stack is a depth limit nobody
+declared.
+
+### System calls
+
+Number in `x8`, arguments in `x0`–`x5`, result in `x0`, following the AArch64 Linux convention. Errors come
+back as small negative values, distinct per cause: the difference between "you never had this" and "you had
+it and it was withdrawn" is what a caller needs in order to react.
+
+| Call | Signature |
+| --- | --- |
+| `SYS_WRITE` | `(handle, ptr, len) -> bytes written` — requires a `Console` and `WRITE` |
+| `SYS_IDENTIFY` | `(handle) -> kind in the low byte, rights above it` |
+| `SYS_DELEGATE` | `(handle, rights) -> handle` — requires `GRANT` |
+| `SYS_REVOKE` | `(handle) -> how many were withdrawn` — requires `REVOKE` |
+| `SYS_EXIT` | `(code)`, does not return |
+
+Every pointer argument is checked against the calling thread's own pages before the kernel dereferences it.
+Without that check a handle with entirely legitimate rights becomes a way to print kernel memory.
 
 ## Scheduling
 
@@ -208,13 +256,14 @@ its prior usage, and a write to `.text` is refused by the hardware.
 | M1 | Exception vectors, GICv2, timer, physical frame allocator | done |
 | M2 | MMU, per-section mapping with W^X, kernel heap | done |
 | M3 | Threads, context switch, preemptive scheduler | done |
-| M4 | User mode, syscalls, capability handles | not started |
-| M5 | Typed IPC and the capability registry | not started |
+| M4 | User mode, syscalls, capability handles | done |
+| M5 | Typed IPC and the capability registry | next |
 | M6 | Userspace services — console, shell | not started |
 | M7 | Agent surface: schema discovery, audit journal | not started |
 
-M0–M3 is conventional kernel work. The thesis begins paying off at M4–M5, where capabilities become
-unforgeable handles and the IPC surface becomes typed and introspectable.
+M0–M3 was conventional kernel work. M4 is where the thesis starts paying: authority is a handle the kernel
+checks rather than a permission the caller happens to have, and it can be taken back. M5 makes the surface
+those handles name typed and introspectable.
 
 # FUTURE
 
@@ -243,47 +292,56 @@ holds.
 - **Prerequisites (owner).** Reopens with M3's successor; requires replacing the spin lock with something a
   thread and the interrupt preempting it can both take.
 
-**4. Capability revocation model — PARKED**
+**4. Capabilities that cross a task boundary — PARKED**
 
-- **What.** Whether a granted capability can be withdrawn, which decides if the kernel carries a derivation
-  tree recording who granted what to whom.
-- **Why it waits.** It changes the shape of every capability and is painful to retrofit.
-- **Prerequisites (owner).** Must be decided before M4 begins. A human approval that cannot be withdrawn is
-  not an approval, which argues for revocation despite the memory it costs.
+- **What.** Delegating a capability into *another* task's space. Today `delegate` derives within one space,
+  which is enough for a thread to narrow its own authority and hand it to itself, and not enough for one
+  task to grant another.
+- **Why it waits.** It needs a second task to grant to, and the derivation links are `u32` indices into one
+  table — crossing spaces means saying what a parent index means when the parent lives elsewhere.
+- **Prerequisites (owner).** Reopens with M5, which is the first time two tasks must name the same object.
 
-**5. Kernel heap growth on demand — PARKED**
+**5. Loading a program from storage — PARKED**
+
+- **What.** Reading a user program from a filesystem rather than assembling it into the kernel image.
+- **Why it waits.** There is no storage driver and no filesystem. The loader itself already does the part
+  that matters — copy while writable, publish to the instruction stream, then narrow to read-execute — so
+  what is missing is where the bytes come from, not what is done with them.
+- **Prerequisites (owner).** Reopens at M6, with the first userspace service that has to be started.
+
+**6. Kernel heap growth on demand — PARKED**
 
 - **What.** Extend the heap from free frames when it is exhausted, rather than fixing it at 2 MiB.
 - **Why it waits.** 2 MiB is sufficient for the current kernel, and a kernel that reserves tens of megabytes
   for itself has spent what the user came for.
 - **Prerequisites (owner).** Reopens when an allocation fails; needs a fault handler to trigger growth.
 
-**6. On-target test framework — PARKED**
+**7. On-target test framework — PARKED**
 
 - **What.** `custom_test_frameworks` so tests run inside the kernel, for behaviour that needs real hardware:
   MMU semantics, exception delivery, context switching.
 - **Why it waits.** The boot assertions cover the current surface.
 - **Prerequisites (owner).** Reopens when a test needs hardware semantics that host arithmetic cannot model.
 
-**7. Hardware-accelerated test harness — CUT**
+**8. Hardware-accelerated test harness — CUT**
 
 - **What.** Running the automated boot test under HVF rather than TCG.
 - **Why.** HVF does not intercept the semihosting trap, so the exit code the harness depends on is lost. The
   kernel boots correctly under HVF, so `scripts/run.sh --accel` uses it for running; testing stays on TCG.
 
-**8. Buddy or size-class frame allocator — CUT**
+**9. Buddy or size-class frame allocator — CUT**
 
 - **What.** Replacing the bitmap with an allocator that serves large contiguous requests faster.
 - **Why.** Both keep per-block structures resident whether or not anything is allocated. The bitmap's flat
   cost of one bit per frame is the correct trade for the target hardware.
 
-**9. Saving the full register set on context switch — CUT**
+**10. Saving the full register set on context switch — CUT**
 
 - **What.** Preserving `x0`–`x18` in `Context` alongside the callee-saved registers.
 - **Why.** The procedure call standard already permits a function to destroy them, so the caller has
   preserved anything it needs. A preempted thread's full state is in its trap frame regardless.
 
-**10. Docker as a way to run Oxygen — CUT**
+**11. Docker as a way to run Oxygen — CUT**
 
 - **What.** Shipping a container image that boots the OS.
 - **Why.** A container shares the host kernel, so it cannot boot one of its own. Running an OS needs a

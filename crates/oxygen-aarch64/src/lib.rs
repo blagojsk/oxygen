@@ -79,19 +79,47 @@ mod tests {
         assert_ne!(d & (1 << 54), 0, "UXN must still be set");
     }
 
-    /// The mapping the first identity map needs: writable so the stack works, executable so the
-    /// instruction after the MMU is enabled can be fetched. Getting either wrong stops the machine
-    /// with no diagnostic at all.
+    /// User code is the one region EL0 may execute, and the one region EL1 must not. A kernel
+    /// that can be tricked into branching into a user page with PXN clear runs user bytes with
+    /// kernel authority.
     #[test]
-    fn rwx_is_writable_and_executable_at_el1() {
-        let d = block(GIB, MemoryKind::Normal, Access::KernelRwx);
-        assert_eq!((d >> 6) & 0b11, 0b00, "must be EL1 read/write");
-        assert_eq!(d & (1 << 53), 0, "PXN must be clear so EL1 can execute it");
-        assert_ne!(
-            d & (1 << 54),
-            0,
-            "UXN must be set: EL0 has no business here"
-        );
+    fn user_code_executes_at_el0_and_never_at_el1() {
+        let d = page(GIB, MemoryKind::Normal, Access::UserCode);
+        assert_eq!((d >> 6) & 0b11, 0b11, "read-only at both levels");
+        assert_eq!(d & (1 << 54), 0, "UXN must be clear so EL0 can execute it");
+        assert_ne!(d & (1 << 53), 0, "PXN must be set so EL1 cannot");
+    }
+
+    /// User data is reachable from EL0 and writable by the kernel, which is how arguments and
+    /// results cross the boundary — but executable by neither.
+    #[test]
+    fn user_data_is_shared_read_write_and_never_executable() {
+        let d = page(GIB, MemoryKind::Normal, Access::UserData);
+        assert_eq!((d >> 6) & 0b11, 0b01, "read/write at EL0 and EL1");
+        assert_ne!(d & (1 << 53), 0, "PXN must be set");
+        assert_ne!(d & (1 << 54), 0, "UXN must be set");
+    }
+
+    /// The boundary in one assertion: no kernel mapping may be reached from EL0, and no user
+    /// mapping may be executed from EL1. Every variant, so a new one cannot quietly opt out.
+    #[test]
+    fn no_kernel_mapping_is_reachable_from_el0() {
+        for access in [
+            Access::KernelData,
+            Access::KernelCode,
+            Access::KernelReadOnly,
+        ] {
+            let ap = (page(GIB, MemoryKind::Normal, access) >> 6) & 0b11;
+            assert_eq!(
+                ap & 0b01,
+                0,
+                "AP {ap:#04b} grants EL0 access to a kernel page"
+            );
+        }
+        for access in [Access::UserCode, Access::UserData] {
+            let d = page(GIB, MemoryKind::Normal, access);
+            assert_ne!(d & (1 << 53), 0, "EL1 must not execute a user page");
+        }
     }
 
     #[test]
@@ -123,6 +151,8 @@ mod tests {
                 Access::KernelData,
                 Access::KernelCode,
                 Access::KernelReadOnly,
+                Access::UserCode,
+                Access::UserData,
             ] {
                 assert_eq!(output_address(block(3 * GIB, kind, access)), 3 * GIB);
             }

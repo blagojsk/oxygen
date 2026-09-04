@@ -7,10 +7,15 @@ name = "oxygen-aarch64"
 version = "0.0.1"
 
 [[package]]
+name = "oxygen-cap"
+version = "0.0.1"
+
+[[package]]
 name = "oxygen-kernel"
 version = "0.0.1"
 dependencies = [
  "oxygen-aarch64",
+ "oxygen-cap",
  "oxygen-mem",
 ]
 

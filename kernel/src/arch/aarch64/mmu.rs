@@ -176,6 +176,51 @@ pub unsafe fn init() {
     );
 }
 
+/// Changes the permissions of one already-mapped 4 KiB page, with translation live.
+///
+/// This is how a page becomes user-visible: the loader copies a program into ordinary kernel
+/// memory, and only then is the page narrowed to read-execute for EL0. Doing it in that order is
+/// what keeps W^X true of user pages as well — the page is never writable and executable at the
+/// same moment.
+///
+/// Only pages inside the 2 MiB the kernel's L3 table covers can be retargeted, because that is the
+/// only table refined to page granularity. Anything else is asserted rather than silently ignored,
+/// since a mapping that quietly did not change is the kind of failure that shows up as a
+/// permission check that never fires.
+///
+/// # Safety
+/// `va` must name a page that is not currently being used under its old permissions by anything
+/// else — in particular, never the caller's own stack or code.
+pub unsafe fn remap_page(va: u64, access: Access) {
+    assert_eq!(va % L3_PAGE_SIZE, 0, "remap needs a page-aligned address");
+    assert!(
+        (RAM_BASE..RAM_BASE + L2_BLOCK_SIZE).contains(&va),
+        "only the kernel's own 2 MiB is mapped at page granularity"
+    );
+
+    let l3 = &raw mut L3_KERNEL;
+    // SAFETY: index is in range by construction, and the boot core is the only writer.
+    unsafe {
+        (*l3).0[paging::index_for(va, 3)] = paging::page(va, MemoryKind::Normal, access);
+    }
+
+    // The walker reads these tables from memory, so the store must be visible to it before the
+    // stale translation is dropped — and the old entry must be gone before anything relies on the
+    // new permissions. Getting this order wrong leaves a cached translation with the old rights,
+    // which is a permission check that passes when it should fault.
+    // SAFETY: maintenance instructions with no operands beyond the address being invalidated.
+    unsafe {
+        core::arch::asm!(
+            "dsb ishst",
+            "tlbi vaae1is, {page}",
+            "dsb ish",
+            "isb",
+            page = in(reg) va >> 12,
+            options(nostack),
+        );
+    }
+}
+
 /// End of the kernel image, page-aligned. Everything above this is free RAM as far as the frame
 /// allocator is concerned; everything below is the kernel and must never be handed out.
 pub fn kernel_end() -> u64 {

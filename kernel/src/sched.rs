@@ -14,12 +14,25 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use oxygen_cap::CapSpace;
+
 use crate::arch::target::context::{self, Context};
 use crate::sync::SpinLock;
 
 /// Per-thread kernel stack. 16 KiB is chosen against the target hardware: enough for the interrupt
 /// nesting this kernel permits, small enough that a hundred threads cost under two megabytes.
 const STACK_SIZE: usize = 16 * 1024;
+
+/// Capability slots per thread.
+///
+/// Fixed rather than growable, and small on purpose: a capability space that can grow without
+/// bound is a way for one task to consume the kernel's memory, and a task that genuinely needs
+/// hundreds of capabilities is describing a design problem rather than a sizing one.
+pub const CAP_SLOTS: usize = 16;
+
+/// Exit code reported for a thread the hardware stopped, as opposed to one that chose to exit.
+/// Distinct from any syscall error so the two can never be confused for one another.
+pub const EXIT_FAULTED: u64 = u64::MAX - 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -34,6 +47,10 @@ pub struct Thread {
     pub name: &'static str,
     pub state: State,
     context: Context,
+    /// Everything this thread is allowed to do. Empty at birth: a thread is born with no
+    /// authority at all and receives it explicitly, which is the only arrangement in which
+    /// "what can this agent do?" has an answer you can actually read.
+    caps: CapSpace<CAP_SLOTS>,
     /// Owned so it is freed when the thread is reaped. Never read directly — the context's stack
     /// pointer is what actually matters — but dropping it while the thread lives would hand its
     /// stack to somebody else.
@@ -51,6 +68,10 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 /// interrupt must never block on a lock the thread it interrupted is holding.
 static NEED_RESCHED: AtomicBool = AtomicBool::new(false);
 static SWITCHES: AtomicU64 = AtomicU64::new(0);
+/// The code the most recently retired thread stopped with, and whether one has retired at all.
+/// Two values rather than a sentinel because every possible `u64` is a legitimate exit code.
+static EXIT_CODE: AtomicU64 = AtomicU64::new(0);
+static HAS_EXITED: AtomicBool = AtomicBool::new(false);
 
 /// Adopts the currently executing code as thread 0.
 ///
@@ -63,6 +84,7 @@ pub fn init() {
         name: "boot",
         state: State::Ready,
         context: Context::default(),
+        caps: CapSpace::new(),
         _stack: None,
     };
     *SCHEDULER.lock() = Some(Scheduler {
@@ -83,6 +105,7 @@ pub fn spawn(name: &'static str, entry: extern "C" fn(usize), arg: usize) -> u64
         name,
         state: State::Ready,
         context: Context::for_new_thread(entry, arg, stack_top),
+        caps: CapSpace::new(),
         _stack: Some(stack),
     };
 
@@ -158,6 +181,18 @@ fn next_ready(s: &Scheduler) -> Option<usize> {
 /// Retires the running thread. Reached when a thread's entry point returns.
 #[unsafe(no_mangle)]
 extern "C" fn thread_exit() -> ! {
+    retire_current(0)
+}
+
+/// Stops the running thread for good and records why.
+///
+/// Does not return, and cannot: it is called from inside a syscall or a fault, where the trap
+/// frame below belongs to a thread that must never resume. The thread stays in the table rather
+/// than being removed — its id keeps meaning something, and its stack is not handed to anyone
+/// while a frame on it is still live.
+pub fn retire_current(code: u64) -> ! {
+    EXIT_CODE.store(code, Ordering::SeqCst);
+    HAS_EXITED.store(true, Ordering::SeqCst);
     {
         let mut guard = SCHEDULER.lock();
         if let Some(s) = guard.as_mut() {
@@ -168,6 +203,32 @@ extern "C" fn thread_exit() -> ! {
         yield_now();
         core::hint::spin_loop();
     }
+}
+
+/// The code the last thread to retire stopped with, if any has.
+pub fn exit_code() -> Option<u64> {
+    HAS_EXITED
+        .load(Ordering::SeqCst)
+        .then(|| EXIT_CODE.load(Ordering::SeqCst))
+}
+
+/// Forgets the last exit code, so a later retirement can be waited for distinctly.
+pub fn clear_exit() {
+    HAS_EXITED.store(false, Ordering::SeqCst);
+}
+
+/// Runs `f` against the capability space of the thread currently on the CPU.
+///
+/// Scoped rather than handing out a reference because the space lives inside the thread table,
+/// behind the scheduler's lock. The closure must not switch threads — nothing it is given the
+/// means to do can.
+pub fn with_caps<R>(f: impl FnOnce(&mut CapSpace<CAP_SLOTS>) -> R) -> R {
+    let mut guard = SCHEDULER.lock();
+    let s = guard
+        .as_mut()
+        .expect("capability access before the scheduler was initialised");
+    let current = s.current;
+    f(&mut s.threads[current].caps)
 }
 
 /// How many threads exist, and how many of those are still runnable.

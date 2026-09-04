@@ -8,6 +8,7 @@ pub mod mmu;
 pub mod semihosting;
 pub mod timer;
 pub mod uart;
+pub mod user;
 
 /// Which exception level the firmware left us at. QEMU's `virt` board and most board firmware
 /// hand control over at EL1; knowing this matters because system register names and behaviour

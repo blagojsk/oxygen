@@ -58,15 +58,17 @@ pub enum Access {
     KernelCode,
     /// Kernel read-only, never executable. Constants.
     KernelReadOnly,
-    /// Kernel read/write *and* executable.
+    /// User read-only and executable at EL0. The kernel may read it and must never execute it.
     ///
-    /// Deliberately coarse and deliberately temporary. It exists because the first identity map
-    /// has to cover the kernel's code and its stack with one descriptor, and those need execute
-    /// and write respectively — mapping that span read-only stops the machine the moment anything
-    /// is pushed, with a recursive fault and no output. Splitting the image into read-execute text
-    /// and read-write data removes the need for this; until then, W^X is not being enforced and
-    /// that should be treated as a known gap rather than a decision.
-    KernelRwx,
+    /// PXN is what makes the second half true. Without it, any kernel bug that transfers control
+    /// to a user address runs user-supplied bytes with kernel authority — the single cheapest
+    /// privilege escalation there is, and one page-table bit removes it.
+    UserCode,
+    /// User read/write, never executable at either level.
+    ///
+    /// The kernel can write it too, which is how arguments and results cross the boundary. What
+    /// it cannot do is run it, so a buffer a user filled is inert no matter who jumps to it.
+    UserData,
 }
 
 impl Access {
@@ -78,7 +80,12 @@ impl Access {
             // AP=10 is EL1 read-only. UXN still set: kernel code is not for userspace to run.
             Access::KernelCode => (0b10 << AP_SHIFT) | UXN,
             Access::KernelReadOnly => (0b10 << AP_SHIFT) | PXN | UXN,
-            Access::KernelRwx => (0b00 << AP_SHIFT) | UXN,
+            // AP=11 is read-only at both levels. UXN clear so EL0 can execute; PXN set so EL1
+            // cannot. Writable user code would defeat W^X on the only pages a user controls.
+            Access::UserCode => (0b11 << AP_SHIFT) | PXN,
+            // AP=01 is read/write at both levels — the kernel needs write access to load a
+            // program and to deliver results into it.
+            Access::UserData => (0b01 << AP_SHIFT) | PXN | UXN,
         }
     }
 }
