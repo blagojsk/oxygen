@@ -121,6 +121,10 @@ pub fn handle_irq() {
         super::timer::TIMER_INTID => {
             TICKS.fetch_add(1, Ordering::Relaxed);
             super::timer::rearm();
+            // Mark, do not switch. Switching here would leave the interrupt unacknowledged for as
+            // long as the next thread runs, and the GIC delivers nothing else at this priority
+            // until it sees the EOI below.
+            crate::sched::request_reschedule();
         }
         other => println!("  [gic] unexpected interrupt {other}"),
     }

@@ -3,17 +3,20 @@
 //! An operating system for agents and humans in equal measure, built to make weak and old hardware
 //! useful again.
 //!
-//! Milestone 2 in progress: the machine can be interrupted, and translation is on. Virtual memory
-//! is the prerequisite for isolating anything from anything else, and therefore for processes,
-//! containers and agents that cannot reach past their own boundaries.
+//! Milestone 3: the machine can be interrupted, memory is translated and protected, and threads
+//! are preemptively scheduled. Concurrency is the prerequisite for a system that can run an agent
+//! and still answer a human.
 
 #![no_std]
 #![no_main]
+
+use core::sync::atomic::{AtomicU64, Ordering};
 
 extern crate alloc;
 
 mod arch;
 mod mm;
+mod sched;
 mod sync;
 
 use arch::target::{self, exceptions, gic, mmu, semihosting, timer};
@@ -45,6 +48,9 @@ pub extern "C" fn kernel_main() -> ! {
         // After the MMU, because the heap's memory is only usable once the identity map covers
         // it, and before the GIC so later bring-up can allocate if it needs to.
         mm::init();
+        // Before interrupts, because the first timer tick asks for a reschedule and there must be
+        // a current thread to reschedule away from.
+        sched::init();
         gic::init();
         timer::init();
         target::enable_irqs();
@@ -90,6 +96,46 @@ fn selftest() -> ! {
         gic::ticks()
     );
 
+    // Prove threads are actually scheduled, not merely created. Three threads spin up counters;
+    // the test passes only once every one of them has made progress, which cannot happen unless
+    // the timer is preempting whichever thread is running and the switcher is restoring the next
+    // one's stack correctly.
+    {
+        sched::spawn("worker-a", worker, 0);
+        sched::spawn("worker-b", worker, 1);
+        sched::spawn("worker-c", worker, 2);
+
+        let (total, ready) = sched::census();
+        println!(
+            "  [selftest] {total} threads exist, {ready} runnable, running as #{}",
+            sched::current_id()
+        );
+        sched::dump();
+
+        let mut spins = 0u64;
+        while COUNTERS.iter().any(|c| c.load(Ordering::Relaxed) < 50) {
+            // Yield rather than spin only: this thread must give the others a turn, and doing it
+            // explicitly proves cooperative yielding works alongside preemption.
+            sched::yield_now();
+            spins += 1;
+            if spins > 5_000_000 {
+                println!("  [selftest] threads did not all progress — FAILED");
+                for (i, c) in COUNTERS.iter().enumerate() {
+                    println!("  [selftest]   worker {i}: {}", c.load(Ordering::Relaxed));
+                }
+                semihosting::exit(1);
+            }
+        }
+
+        println!(
+            "  [selftest] 3 threads interleaved ({}, {}, {}) over {} switches — ok",
+            COUNTERS[0].load(Ordering::Relaxed),
+            COUNTERS[1].load(Ordering::Relaxed),
+            COUNTERS[2].load(Ordering::Relaxed),
+            sched::switches(),
+        );
+    }
+
     // Prove the heap actually works, rather than merely reporting a size. Growing a Vec past its
     // initial capacity forces a real allocate-copy-free cycle through the global allocator.
     {
@@ -131,6 +177,18 @@ fn selftest() -> ! {
 
     println!("  [selftest] write to .text SUCCEEDED — W^X is NOT enforced — FAILED");
     semihosting::exit(1)
+}
+
+/// Counters the selftest's worker threads advance, one each.
+static COUNTERS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+/// A selftest worker. Runs forever: the point is that it keeps getting scheduled, not that it
+/// finishes.
+extern "C" fn worker(index: usize) {
+    loop {
+        COUNTERS[index].fetch_add(1, Ordering::Relaxed);
+        sched::yield_now();
+    }
 }
 
 /// Where every unrecoverable error ends up.
