@@ -25,6 +25,12 @@ pub const SYS_DELEGATE: u64 = 2;
 pub const SYS_REVOKE: u64 = 3;
 /// Stop the calling thread. `(code)`, and does not return.
 pub const SYS_EXIT: u64 = 4;
+/// Read typed characters. `(handle, ptr, cap) -> bytes read`. Requires `READ`; blocks.
+pub const SYS_READ: u64 = 10;
+/// Name the service published at an index. `(registry, index, ptr, cap) -> len`.
+pub const SYS_SERVICES: u64 = 11;
+/// Timer ticks since boot. `() -> ticks`.
+pub const SYS_UPTIME: u64 = 12;
 /// Create an IPC endpoint. `() -> handle`.
 pub const SYS_ENDPOINT: u64 = 5;
 /// Send a typed message. `(handle, interface, method, ptr, len) -> 0`. Requires `WRITE`.
@@ -101,6 +107,9 @@ pub fn dispatch(number: u64, args: [u64; 6]) -> u64 {
         SYS_DELEGATE => delegate(Handle::from_raw(args[0]), Rights::from_bits(args[1] as u32)),
         SYS_REVOKE => revoke(Handle::from_raw(args[0])),
         SYS_EXIT => exit(args[0]),
+        SYS_READ => read(Handle::from_raw(args[0]), args[1], args[2]),
+        SYS_SERVICES => services(Handle::from_raw(args[0]), args[1], args[2], args[3]),
+        SYS_UPTIME => crate::arch::target::gic::ticks(),
         SYS_ENDPOINT => endpoint(),
         SYS_SEND => send(
             Handle::from_raw(args[0]),
@@ -150,6 +159,45 @@ fn write(handle: Handle, ptr: u64, len: u64) -> u64 {
     let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
     crate::arch::target::uart::write_bytes(bytes);
     len
+}
+
+/// Waits for typed input and copies it into the caller's buffer.
+///
+/// Blocks until at least one byte exists, then takes everything available up to `capacity`.
+/// Returning as soon as there is *something* rather than waiting for a full buffer is what makes a
+/// shell feel like a shell: a reader that waits for `capacity` bytes would hold the first
+/// character until the last one arrived.
+fn read(handle: Handle, ptr: u64, capacity: u64) -> u64 {
+    let (object, rights) = match crate::sched::with_caps(|caps| caps.get(handle)) {
+        Ok(pair) => pair,
+        Err(e) => return code_for(e),
+    };
+    if !matches!(object, Object::Console) {
+        return E_WRONGTYPE;
+    }
+    if !rights.contains(Rights::READ) {
+        return E_RIGHTS;
+    }
+    if capacity == 0 || !crate::arch::target::user::is_user_writable(ptr, capacity) {
+        return E_FAULT;
+    }
+
+    use crate::arch::target::uart;
+
+    let mut written = 0usize;
+    loop {
+        while written < capacity as usize {
+            let Some(byte) = uart::read_byte() else { break };
+            // SAFETY: the range was checked to be a writable user page, and `written` is bounded
+            // by `capacity` on every iteration.
+            unsafe { core::ptr::write_volatile((ptr as *mut u8).add(written), byte) };
+            written += 1;
+        }
+        if written > 0 {
+            return written as u64;
+        }
+        crate::sched::block_current_on(crate::sched::WAIT_CONSOLE);
+    }
 }
 
 /// Describes a capability to its holder: what it is, and what it permits.
@@ -334,6 +382,34 @@ fn lookup(registry: Handle, ptr: u64, len: u64) -> u64 {
         Ok(handle) => handle.raw(),
         Err(e) => code_for(e),
     }
+}
+
+/// Names the service published at an index, so userspace can enumerate what exists.
+///
+/// Enumeration is a separate right from lookup in spirit but not yet in the rights bitmask; both
+/// need `READ` on the registry. What matters is that neither is ambient: a task that was granted
+/// no registry capability cannot discover anything, which is what stops discoverability from
+/// quietly becoming a way around the capability system.
+fn services(registry: Handle, index: u64, ptr: u64, capacity: u64) -> u64 {
+    if let Err(code) = registry_of(registry, Rights::READ) {
+        return code;
+    }
+    if capacity == 0 || capacity > MAX_NAME as u64 {
+        return E_INVAL;
+    }
+    if !crate::arch::target::user::is_user_writable(ptr, capacity) {
+        return E_FAULT;
+    }
+
+    let mut scratch = [0u8; MAX_NAME];
+    let Some(len) = crate::ipc::service_at(index as usize, &mut scratch[..capacity as usize])
+    else {
+        return E_NOENT;
+    };
+    // SAFETY: the destination was checked to be a writable user page with room for `capacity`
+    // bytes, and `len` is bounded by that.
+    unsafe { core::ptr::copy_nonoverlapping(scratch.as_ptr(), ptr as *mut u8, len) };
+    len as u64
 }
 
 /// Publishes an endpoint the caller holds under a name.

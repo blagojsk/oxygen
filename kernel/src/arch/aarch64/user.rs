@@ -12,7 +12,6 @@
 //! narrow the page to read-execute and never widen it again.
 
 use core::arch::global_asm;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 use oxygen_aarch64::paging::{Access, L3_PAGE_SIZE};
 
@@ -29,8 +28,6 @@ const PAGE: usize = L3_PAGE_SIZE as usize;
 #[repr(C, align(4096))]
 struct Page([u8; PAGE]);
 
-/// Where the user program is loaded. Zeroed, so it costs image space only in `.bss`.
-static mut USER_TEXT: Page = Page([0; PAGE]);
 /// How many user threads can be running at once.
 ///
 /// Each needs its own stack page, and a stack page is the smallest unit of memory the MMU can give
@@ -41,28 +38,21 @@ pub const USER_SLOTS: usize = 4;
 /// The user threads' stacks. Separate pages from the code, never executable.
 static mut USER_STACKS: [Page; USER_SLOTS] = [const { Page([0; PAGE]) }; USER_SLOTS];
 
-/// Where the loaded program starts and where its stack ends, published once by [`load`].
-///
-/// Statics rather than return values because the thread that enters EL0 is spawned with a single
-/// `usize` argument, and that argument is already spoken for: it carries the capability the
-/// program is born holding.
-static ENTRY: AtomicU64 = AtomicU64::new(0);
-static TRESPASS_ENTRY: AtomicU64 = AtomicU64::new(0);
-static SERVER_ENTRY: AtomicU64 = AtomicU64::new(0);
-static CLIENT_ENTRY: AtomicU64 = AtomicU64::new(0);
-
 global_asm!(
     r#"
 // The first program to run outside the kernel.
 //
-// It lives in .rodata because until the loader copies it, it is data — the kernel never executes
-// these bytes in place. Everything here is position-independent: it is assembled at one address
-// and runs at another, so every reference to its own strings goes through ADR.
+// It lives in .user_text, the only section of the image EL0 may fetch from, and it runs at the
+// address it was linked at — the whole space is identity-mapped, so there is nothing to relocate.
+// References to its own strings still go through ADR, which costs nothing and keeps these movable
+// if that ever stops being true.
 //
 // What it proves, in order: EL0 can reach the console only by presenting a capability; authority
 // can be narrowed and handed on; and a withdrawn grant stops working while the grantor's own
 // keeps working. The last one is the entire argument for carrying a derivation tree.
-.section .rodata
+// "ax" is load-bearing: a bare .section directive with no flags produces a section the linker
+// does not allocate, and the symbols come out at address zero.
+.section .user_text,"ax",@progbits
 .balign 4
 .global __user_program_start
 __user_program_start:
@@ -237,55 +227,27 @@ __user_client_end:
 
 unsafe extern "C" {
     static __user_program_start: u8;
-    static __user_program_end: u8;
     static __user_trespass_start: u8;
     static __user_server_start: u8;
     static __user_client_start: u8;
-    static __user_client_end: u8;
 }
 
-/// Copies the program into its page, publishes it to the instruction stream, and narrows the
-/// permissions. Returns the entry point and the top of the user stack.
+/// Gives the user stacks their EL0 permissions.
+///
+/// The programs themselves need nothing done to them: they are linked into `.user_text`, which
+/// `mmu::init` has already mapped EL0-executable, and they run at the address they were linked at.
+/// The stacks are the exception — they live in `.bss` and start life as ordinary kernel data.
 ///
 /// # Safety
 /// Runs once, before any user thread exists. Retargeting a live page's permissions underneath
 /// something already using it would fault it at an arbitrary instruction.
 pub unsafe fn load() {
-    // Both programs are copied as one span. They are emitted contiguously into the same section,
-    // so a single copy preserves the distance between them and each one's entry point is found by
-    // the offset it had at assembly time.
-    let src = &raw const __user_program_start;
-    let end = &raw const __user_client_end;
-    let len = end as usize - src as usize;
-    assert!(len <= PAGE, "user programs do not fit in one page");
-
-    let text = (&raw mut USER_TEXT).cast::<u8>();
-
-    // SAFETY: `src..end` is the program the assembler emitted, `text` is a whole page we own, and
-    // the length is checked above to fit. The regions cannot overlap: one is in .rodata, the other
-    // in .bss.
-    unsafe { core::ptr::copy_nonoverlapping(src, text, len) };
-
-    // SAFETY: the bytes are in place; this makes them visible to instruction fetch.
-    unsafe { publish_as_code(text as u64, len) };
-
-    // SAFETY: nothing is executing from or writing to any of these pages yet — no user thread has
-    // been entered.
+    // SAFETY: no user thread has been entered, so none of these pages is in use.
     unsafe {
-        mmu::remap_page(text as u64, Access::UserCode);
         for slot in 0..USER_SLOTS {
             mmu::remap_page(stack_base(slot), Access::UserData);
         }
     }
-
-    // Each program's entry point is where it sat relative to the start of the copied span.
-    let base = text as u64;
-    // SAFETY: taking the addresses of linker-provided symbols, all inside the copied span.
-    let offset = |s: *const u8| base + ((s as usize - src as usize) as u64);
-    ENTRY.store(base, Ordering::SeqCst);
-    TRESPASS_ENTRY.store(offset(&raw const __user_trespass_start), Ordering::SeqCst);
-    SERVER_ENTRY.store(offset(&raw const __user_server_start), Ordering::SeqCst);
-    CLIENT_ENTRY.store(offset(&raw const __user_client_start), Ordering::SeqCst);
 }
 
 /// Base address of one user stack page.
@@ -301,62 +263,22 @@ pub fn stack_top(slot: usize) -> u64 {
 
 /// Entry point of the program that exercises capabilities.
 pub fn program() -> u64 {
-    ENTRY.load(Ordering::SeqCst)
+    (&raw const __user_program_start) as u64
 }
 
 /// Entry point of the program that deliberately reads where it may not.
 pub fn trespasser() -> u64 {
-    TRESPASS_ENTRY.load(Ordering::SeqCst)
+    (&raw const __user_trespass_start) as u64
 }
 
 /// Entry point of the program that publishes an endpoint and waits on it.
 pub fn server() -> u64 {
-    SERVER_ENTRY.load(Ordering::SeqCst)
+    (&raw const __user_server_start) as u64
 }
 
 /// Entry point of the program that looks that endpoint up and sends to it.
 pub fn client() -> u64 {
-    CLIENT_ENTRY.load(Ordering::SeqCst)
-}
-
-/// Makes freshly written bytes executable, as far as the caches are concerned.
-///
-/// Instruction and data caches are not coherent with each other on AArch64. Code written through
-/// the data side sits in the data cache while the instruction side still holds — or fetches —
-/// whatever was there before. Skipping this does not fail predictably: it works until a cache line
-/// happens to be stale, and then executes something that was never written.
-///
-/// # Safety
-/// `addr..addr + len` must be memory the caller owns.
-unsafe fn publish_as_code(addr: u64, len: usize) {
-    // CTR_EL0 reports cache line sizes as log2 of the number of 4-byte words.
-    let ctr: u64;
-    // SAFETY: CTR_EL0 is readable at EL1 and reading it has no side effects.
-    unsafe { core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack)) };
-    let dcache_line = 4u64 << ((ctr >> 16) & 0xF);
-    let icache_line = 4u64 << (ctr & 0xF);
-    let end = addr + len as u64;
-
-    // Clean the data cache to the point of unification, so the bytes reach memory the instruction
-    // side will look at.
-    let mut p = addr & !(dcache_line - 1);
-    while p < end {
-        // SAFETY: maintenance by virtual address on memory the caller owns.
-        unsafe { core::arch::asm!("dc cvau, {}", in(reg) p, options(nostack)) };
-        p += dcache_line;
-    }
-    // SAFETY: ordering barrier; the cleans must complete before the invalidates begin.
-    unsafe { core::arch::asm!("dsb ish", options(nostack)) };
-
-    // Then discard any stale instruction-cache lines covering the same addresses.
-    let mut p = addr & !(icache_line - 1);
-    while p < end {
-        // SAFETY: maintenance by virtual address on memory the caller owns.
-        unsafe { core::arch::asm!("ic ivau, {}", in(reg) p, options(nostack)) };
-        p += icache_line;
-    }
-    // SAFETY: the ISB is what makes the invalidation visible to this core's own fetch.
-    unsafe { core::arch::asm!("dsb ish", "isb", options(nostack)) };
+    (&raw const __user_client_start) as u64
 }
 
 /// Whether a user-supplied pointer names memory the kernel is willing to read on its behalf.
@@ -365,8 +287,12 @@ unsafe fn publish_as_code(addr: u64, len: usize) {
 /// this check `write(handle, 0xffff_0000, 4096)` would print kernel memory to the console — the
 /// capability system would be intact and the secret would be gone anyway.
 pub fn is_user_readable(ptr: u64, len: u64) -> bool {
-    let text = (&raw const USER_TEXT) as u64;
-    within(ptr, len, text) || is_user_writable(ptr, len)
+    let (start, end) = mmu::user_region();
+    let in_programs = match ptr.checked_add(len) {
+        Some(last) => ptr >= start && last <= end,
+        None => false,
+    };
+    in_programs || is_user_writable(ptr, len)
 }
 
 /// Whether a user-supplied pointer names memory the kernel may write results into.

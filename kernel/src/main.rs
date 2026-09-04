@@ -57,6 +57,8 @@ pub extern "C" fn kernel_main() -> ! {
         ipc::init();
         gic::init();
         timer::init();
+        // After the GIC, which owns the line it enables.
+        arch::target::uart::init_rx();
         // After the MMU, which it needs in order to narrow a page's permissions, and before any
         // thread can be entered into it.
         user::load();
@@ -69,7 +71,10 @@ pub extern "C" fn kernel_main() -> ! {
         selftest()
     }
 
-    println!("  idle. interrupts are live — the timer is ticking.");
+    // A service to find, and something to find it with. The boot thread has nothing left to do
+    // but exist: it parks, and the timer preempts it into the shell.
+    sched::spawn("server", server_thread, 0);
+    sched::spawn("shell", shell_thread, 0);
     target::wait_for_interrupt()
 }
 
@@ -326,6 +331,15 @@ extern "C" fn client_thread(_arg: usize) {
     let (console, registry) = seed_capabilities();
     // SAFETY: mapped EL0-executable alongside the other programs; stack slot 3 is its own.
     unsafe { user::enter(user::client(), user::stack_top(3), console, registry) }
+}
+
+/// The kernel half of the shell.
+extern "C" fn shell_thread(_arg: usize) {
+    let (console, registry) = seed_capabilities();
+    let entry = arch::target::shell::main as *const () as u64;
+    // SAFETY: `shell::main` is linked into `.user_text`, which `mmu::init` mapped EL0-executable,
+    // and stack slot 0 belongs to this thread — the selftest programs that use it do not run here.
+    unsafe { user::enter(entry, user::stack_top(0), console, registry) }
 }
 
 /// Waits for a thread to retire and returns what it stopped with, failing the run if it never does.

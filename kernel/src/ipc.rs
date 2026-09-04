@@ -141,6 +141,23 @@ pub fn lookup(name: &Name) -> Result<u64, IpcFault> {
     registry.lookup(name).ok_or(IpcFault::NotFound)
 }
 
+/// The name published at `index`, copied into `out`, returning its length.
+///
+/// Index rather than a cursor because the caller is across a privilege boundary and must not hold
+/// a borrow into the kernel's registry. Walking by index re-reads the table each time, which is
+/// the right trade at sixteen entries and is why the registry is capped at that.
+pub fn service_at(index: usize, out: &mut [u8]) -> Option<usize> {
+    let guard = REGISTRY.lock();
+    let registry = guard.as_ref()?;
+    let (name, _) = registry.iter().nth(index)?;
+    let bytes = name.as_bytes();
+    if bytes.len() > out.len() {
+        return None;
+    }
+    out[..bytes.len()].copy_from_slice(bytes);
+    Some(bytes.len())
+}
+
 /// Prints what is currently published.
 ///
 /// The registry being enumerable is half the point of having one. A system whose services can only

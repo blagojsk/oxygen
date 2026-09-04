@@ -30,6 +30,13 @@ const STACK_SIZE: usize = 16 * 1024;
 /// hundreds of capabilities is describing a design problem rather than a sizing one.
 pub const CAP_SLOTS: usize = 16;
 
+/// The wait channel a thread parks on while waiting for console input.
+///
+/// Zero, which endpoint ids deliberately never use — they start at 1. A wait channel is any number
+/// two parties agree on; endpoints name themselves and the console gets the one value left over,
+/// so the two can never collide without somebody having changed that on purpose.
+pub const WAIT_CONSOLE: u64 = 0;
+
 /// Exit code reported for a thread the hardware stopped, as opposed to one that chose to exit.
 /// Distinct from any syscall error so the two can never be confused for one another.
 pub const EXIT_FAULTED: u64 = u64::MAX - 1;

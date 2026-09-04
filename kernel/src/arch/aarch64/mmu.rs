@@ -30,6 +30,8 @@ unsafe extern "C" {
     static __text_end: u8;
     static __rodata_start: u8;
     static __rodata_end: u8;
+    static __user_start: u8;
+    static __user_end: u8;
     static __data_start: u8;
     static __kernel_end: u8;
 }
@@ -111,9 +113,10 @@ pub unsafe fn init() {
             sym(&__rodata_end),
             Access::KernelReadOnly,
         );
+        let user = (sym(&__user_start), sym(&__user_end), Access::UserCode);
         let data = (sym(&__data_start), kernel_end, Access::KernelData);
 
-        for (start, end, access) in [text, rodata, data] {
+        for (start, end, access) in [text, rodata, user, data] {
             let mut pa = start;
             while pa < end {
                 let index = paging::index_for(pa, 3);
@@ -225,6 +228,11 @@ pub unsafe fn remap_page(va: u64, access: Access) {
 /// allocator is concerned; everything below is the kernel and must never be handed out.
 pub fn kernel_end() -> u64 {
     sym(unsafe { &__kernel_end })
+}
+
+/// The span of the image that EL0 may execute. Nothing else in the image is reachable from there.
+pub fn user_region() -> (u64, u64) {
+    (sym(unsafe { &__user_start }), sym(unsafe { &__user_end }))
 }
 
 /// Address of a byte inside `.text`, for the selftest that proves code is not writable.

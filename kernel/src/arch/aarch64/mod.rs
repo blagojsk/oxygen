@@ -6,6 +6,7 @@ pub mod exceptions;
 pub mod gic;
 pub mod mmu;
 pub mod semihosting;
+pub mod shell;
 pub mod timer;
 pub mod uart;
 pub mod user;
@@ -31,6 +32,36 @@ pub fn current_el() -> u64 {
 pub unsafe fn enable_irqs() {
     // SAFETY: delegated to the caller, per the contract above.
     unsafe { core::arch::asm!("msr daifclr, #2", options(nomem, nostack)) };
+}
+
+/// Masks IRQs and returns the previous interrupt state, for [`restore_irqs`] to put back.
+///
+/// This is what makes a lock safe to take in a thread and in the interrupt that would otherwise
+/// preempt it. On one core, masking is enough: an interrupt that cannot arrive cannot try to take
+/// a lock the interrupted code is already holding.
+pub fn save_and_mask_irqs() -> u64 {
+    let daif: u64;
+    // SAFETY: reads DAIF and sets the I bit. Both are ordinary PSTATE manipulations at EL1, and
+    // the read happens before the mask so the caller gets the state to restore.
+    unsafe {
+        core::arch::asm!(
+            "mrs {out}, daif",
+            "msr daifset, #2",
+            out = out(reg) daif,
+            options(nomem, nostack),
+        )
+    };
+    daif
+}
+
+/// Puts back what [`save_and_mask_irqs`] returned.
+///
+/// # Safety
+/// `state` must be a value that call returned, and the caller must be finished with whatever the
+/// masking was protecting.
+pub unsafe fn restore_irqs(state: u64) {
+    // SAFETY: delegated to the caller, per the contract above.
+    unsafe { core::arch::asm!("msr daif, {}", in(reg) state, options(nomem, nostack)) };
 }
 
 pub fn wait_for_interrupt() -> ! {

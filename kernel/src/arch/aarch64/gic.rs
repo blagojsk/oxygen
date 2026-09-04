@@ -126,6 +126,7 @@ pub fn handle_irq() {
             // until it sees the EOI below.
             crate::sched::request_reschedule();
         }
+        super::uart::UART_INTID => super::uart::handle_irq(),
         other => println!("  [gic] unexpected interrupt {other}"),
     }
 

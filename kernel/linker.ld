@@ -32,6 +32,20 @@ SECTIONS
         __rodata_end = .;
     }
 
+    /*
+     * Executable at EL0 and nowhere else: the programs that run outside the kernel.
+     *
+     * Its own section, page-aligned at both ends, because permissions have page granularity and
+     * these pages are the only ones in the image EL0 may fetch from. Sharing a page with .rodata
+     * would either make kernel constants readable from userspace or make this unexecutable.
+     */
+    .user : ALIGN(4096) {
+        __user_start = .;
+        *(.user_text .user_text.*)
+        . = ALIGN(4096);
+        __user_end = .;
+    }
+
     /* Writable, never executable: initialised data, zeroed data, page tables and the stack. */
     .data : ALIGN(4096) {
         __data_start = .;

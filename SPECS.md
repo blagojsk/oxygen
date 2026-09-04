@@ -61,11 +61,14 @@ A Cargo workspace. Everything freestanding.
 | `kernel/linker.ld` | memory layout; `build.rs` passes it to the linker |
 | `kernel/src/syscall.rs` | the system call surface — everything EL0 can ask for |
 | `kernel/src/ipc.rs` | endpoints, blocking, and the name registry |
+| `kernel/src/arch/aarch64/shell.rs` | the shell — Rust compiled into the EL0 section |
+| `kernel/src/arch/aarch64/user.rs` | entering EL0, and the test programs that run there |
 | `crates/oxygen-mem/` | portable memory logic: addresses, frame allocator, heap |
 | `crates/oxygen-aarch64/` | AArch64 encodings that are pure arithmetic |
 | `crates/oxygen-cap/` | portable capability logic: handles, rights, derivation, revocation |
 | `crates/oxygen-ipc/` | portable message, queue and registry logic |
 | `scripts/` | developer and CI entry points |
+| `scripts/check-userspace.sh` | asserts no EL0 code branches into the kernel |
 | `.cargo/config.toml` | default target and the QEMU runner |
 | `rust-toolchain.toml` | pinned compiler, components and target |
 
@@ -107,8 +110,9 @@ fixed order, and the order is the load-bearing fact.*
 | 6 | Brings up the GIC distributor and CPU interface | `arch/aarch64/gic.rs` |
 | 7 | Starts the generic timer | `arch/aarch64/timer.rs` |
 | 8 | Creates the endpoint table and the name registry | `ipc.rs` |
-| 9 | Loads the user programs into a page and narrows it to EL0 read-execute | `arch/aarch64/user.rs` |
-| 10 | Unmasks IRQs | `arch/aarch64/mod.rs` |
+| 9 | Enables UART receive interrupts | `arch/aarch64/uart.rs` |
+| 10 | Gives the user stacks their EL0 permissions | `arch/aarch64/user.rs` |
+| 11 | Unmasks IRQs | `arch/aarch64/mod.rs` |
 
 Order is load-bearing: vectors before any interrupt can be delivered, the MMU before the GIC whose registers
 are reached through the device mapping, the scheduler before the first timer tick asks for a reschedule.
@@ -200,6 +204,9 @@ it and it was withdrawn" is what a caller needs in order to react.
 | `SYS_RECV` | `(handle, ptr, cap) -> bytes written` — requires `READ`; blocks |
 | `SYS_LOOKUP` | `(registry, name_ptr, name_len) -> handle` — requires `READ` on the registry |
 | `SYS_REGISTER` | `(registry, name_ptr, name_len, endpoint) -> 0` — requires `WRITE` on the registry and `GRANT` on the endpoint |
+| `SYS_READ` | `(handle, ptr, cap) -> bytes read` — requires `READ` on a console; blocks |
+| `SYS_SERVICES` | `(registry, index, ptr, cap) -> len` — the name published at an index |
+| `SYS_UPTIME` | `() -> timer ticks since boot` |
 
 Every pointer argument is checked against the calling thread's own pages before the kernel dereferences it.
 Without that check a handle with entirely legitimate rights becomes a way to print kernel memory.
@@ -234,6 +241,41 @@ scheduler's, so no path holds both.
 Discovery is itself an authority: looking a name up requires a capability on the registry. A
 capability handed back by `SYS_LOOKUP` carries `READ | WRITE` but never `GRANT` — finding a service
 lets you talk to it, not advertise it as yours.
+
+## Userspace and the shell
+
+Programs run at EL0 and are linked into `.user`, a section of the kernel image that is the only one
+EL0 may fetch from — read-only at both levels, executable at EL0, never executable at EL1. They run
+at the address they were linked at, because the whole space is identity-mapped.
+
+Being in the kernel's image does not make them part of the kernel, and the boundary is enforced two
+ways. At run time the MMU refuses EL0 any access to kernel pages. At build time
+`scripts/check-userspace.sh` disassembles `.user` and fails if any branch leaves it.
+
+That build-time check is not belt-and-braces, it is load-bearing. Ordinary Rust reaches into `core`
+constantly and a debug build reaches further: `Range::contains` is a call, `slice::get_unchecked` is
+a call, `let buf = [0u8; 128]` can be a call to `memset`, and every `+=` carries an overflow check
+that calls `core::panicking`. All of those live in kernel `.text`, and from EL0 each one is an
+instruction abort on whichever line happens to run first. So EL0 code here uses raw pointer reads,
+`MaybeUninit` instead of zeroed arrays, and `wrapping_*` arithmetic — and the check enforces it
+rather than review.
+
+**Console input** is interrupt-driven: the PL011 raises SPI 1 (INTID 33) on receive or receive
+timeout, the handler drains the FIFO into a 256-byte ring and wakes anyone parked on the console
+wait channel. The timeout interrupt matters as much as the receive one — without it a few
+characters that never fill the FIFO would sit there until somebody typed enough more. A full ring
+says so once and then drops quietly; input that vanishes without a word is a keyboard that looks
+broken.
+
+Echo is the shell's job, not the kernel's. The kernel has no idea whether whatever is on the other
+end wants to see what it typed, and an agent driving this over a pipe does not.
+
+| Command | Does |
+| --- | --- |
+| `help` | lists these |
+| `services` | enumerates the registry — what is published, discovered rather than known in advance |
+| `uptime` | timer ticks since boot |
+| `echo ...` | hands the rest of the line back |
 
 ## Scheduling
 
@@ -297,12 +339,13 @@ its prior usage, and a write to `.text` is refused by the hardware.
 | M3 | Threads, context switch, preemptive scheduler | done |
 | M4 | User mode, syscalls, capability handles | done |
 | M5 | Typed IPC and the capability registry | done |
-| M6 | Userspace services — console, shell | next |
-| M7 | Agent surface: schema discovery, audit journal | not started |
+| M6 | Userspace services — console, shell | done |
+| M7 | Agent surface: schema discovery, audit journal | next |
 
-M0–M3 was conventional kernel work. M4 is where the thesis starts paying: authority is a handle the kernel
-checks rather than a permission the caller happens to have, and it can be taken back. M5 makes the surface
-those handles name typed and introspectable.
+M0–M3 was conventional kernel work. M4–M6 are where the thesis starts paying: authority is a handle the
+kernel checks rather than a permission the caller happens to have, it can be taken back, and what those
+handles name is discoverable at run time rather than known in advance. M7 turns that surface into one an
+agent can read as a schema and a human can read as help.
 
 # FUTURE
 
@@ -366,39 +409,57 @@ holds.
   what is missing is where the bytes come from, not what is done with them.
 - **Prerequisites (owner).** Reopens at M6, with the first userspace service that has to be started.
 
-**8. Kernel heap growth on demand — PARKED**
+**8. Userspace built as its own binary — PARKED**
+
+- **What.** Compiling userspace as a separate crate against a syscall shim, linked as a blob, rather than as
+  modules of the kernel crate placed in a section by attribute.
+- **Why it waits.** The section trick works and is checked mechanically, so what is missing is ergonomics
+  rather than correctness — EL0 code currently cannot use ordinary Rust, because `core` is not reachable
+  from it. That is a real cost and it grows with every program.
+- **Prerequisites (owner).** Reopens when a program needs more than the shell does, or when the second
+  architecture makes the per-architecture placement untenable.
+
+**9. Interrupt masking is not enough on more than one core — PARKED**
+
+- **What.** `SpinLock` masks interrupts while held, which makes it safe against the interrupt that would
+  preempt it. Another core can still hold the lock while this one masks.
+- **Why it waits.** There is one core.
+- **Prerequisites (owner).** Part of multi-core support; recorded separately because it is a property of the
+  lock rather than of the scheduler.
+
+**10. Kernel heap growth on demand — PARKED**
 
 - **What.** Extend the heap from free frames when it is exhausted, rather than fixing it at 2 MiB.
 - **Why it waits.** 2 MiB is sufficient for the current kernel, and a kernel that reserves tens of megabytes
   for itself has spent what the user came for.
 - **Prerequisites (owner).** Reopens when an allocation fails; needs a fault handler to trigger growth.
 
-**9. On-target test framework — PARKED**
+**11. On-target test framework — PARKED**
 
 - **What.** `custom_test_frameworks` so tests run inside the kernel, for behaviour that needs real hardware:
   MMU semantics, exception delivery, context switching.
 - **Why it waits.** The boot assertions cover the current surface.
 - **Prerequisites (owner).** Reopens when a test needs hardware semantics that host arithmetic cannot model.
 
-**10. Hardware-accelerated test harness — CUT**
+**12. Hardware-accelerated test harness — CUT**
 
 - **What.** Running the automated boot test under HVF rather than TCG.
 - **Why.** HVF does not intercept the semihosting trap, so the exit code the harness depends on is lost. The
   kernel boots correctly under HVF, so `scripts/run.sh --accel` uses it for running; testing stays on TCG.
 
-**11. Buddy or size-class frame allocator — CUT**
+**13. Buddy or size-class frame allocator — CUT**
 
 - **What.** Replacing the bitmap with an allocator that serves large contiguous requests faster.
 - **Why.** Both keep per-block structures resident whether or not anything is allocated. The bitmap's flat
   cost of one bit per frame is the correct trade for the target hardware.
 
-**12. Saving the full register set on context switch — CUT**
+**14. Saving the full register set on context switch — CUT**
 
 - **What.** Preserving `x0`–`x18` in `Context` alongside the callee-saved registers.
 - **Why.** The procedure call standard already permits a function to destroy them, so the caller has
   preserved anything it needs. A preempted thread's full state is in its trap frame regardless.
 
-**13. Docker as a way to run Oxygen — CUT**
+**15. Docker as a way to run Oxygen — CUT**
 
 - **What.** Shipping a container image that boots the OS.
 - **Why.** A container shares the host kernel, so it cannot boot one of its own. Running an OS needs a

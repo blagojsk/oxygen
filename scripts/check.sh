@@ -24,4 +24,8 @@ echo "==> host tests"
 echo "==> boot"
 ./scripts/boot-test.sh
 
+# After the boot, which is what leaves a linked image on disk to inspect.
+echo "==> userspace containment"
+./scripts/check-userspace.sh
+
 echo "==> all green"

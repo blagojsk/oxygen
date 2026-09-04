@@ -10,11 +10,20 @@ agents have to scrape and guess at, and as rigid ABIs that nothing can discover 
 starts from the opposite premise — a capability is one typed, self-describing thing, rendered for
 whoever is asking.
 
-**Status: milestone 5.** It boots on bare metal, routes its own exceptions, takes timer interrupts,
-maps itself with page tables that refuse a write to its own code, allocates from a kernel heap, and
-preempts between threads. Unprivileged programs reach the kernel only by presenting a capability —
-one that can be narrowed, handed on, and taken back again — and find each other by publishing
-endpoints under names, then exchanging typed messages over them.
+**Status: milestone 6 — it has a prompt.** Boot it and type at it:
+
+```
+oxygen$ services
+  echo
+oxygen$ echo it works
+it works
+```
+
+Underneath: it routes its own exceptions, maps itself with page tables that refuse a write to its
+own code, allocates from a kernel heap, and preempts between threads. Unprivileged programs reach
+the kernel only by presenting a capability — one that can be narrowed, handed on, and taken back
+again — and find each other by publishing endpoints under names, then exchanging typed messages
+over them. The shell is one of those programs, with no more authority than it was handed.
 
 ## Starting it
 
@@ -66,13 +75,14 @@ modules so that port is additive rather than a rewrite.
 | M3 | Threads, context switch, preemptive scheduler | **done** |
 | M4 | User mode, syscalls, capability handles | **done** |
 | M5 | Typed IPC and the capability registry | **done** |
-| M6 | Userspace services — console, shell | next |
-| M7 | Agent surface: schema discovery, audit journal | |
+| M6 | Userspace services — console, shell | **done** |
+| M7 | Agent surface: schema discovery, audit journal | next |
 
-M0–M3 was conventional kernel work that any OS needs. M4–M5 are where the thesis starts paying: a
+M0–M3 was conventional kernel work that any OS needs. M4–M6 are where the thesis starts paying: a
 program holds no ambient authority, only handles the kernel checks — a grant can be withdrawn,
 because an approval nobody can take back is not an approval — and what those handles name is a
-typed, enumerable surface rather than a set of numbers you had to be told.
+typed, enumerable surface rather than a set of numbers you had to be told. `services` is that
+surface, seen by a human. M7 is the same surface seen by an agent.
 
 ## Licence
 
