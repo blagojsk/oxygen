@@ -81,24 +81,20 @@ commit messages are for.
 
 # Model use and delegation
 
-Match the model to the job, and spend the expensive ones on thinking rather than typing. Whichever model is
-primary delegates work *downward*, never sideways or up:
+**Delegation.** Spend the expensive models on thinking, not typing. **The primary model decides what it does itself
+and what it hands down — it never reaches for a model above it.** And for each task it hands down it chooses the
+**cheapest worker that will do the job well**: the stronger worker is a choice the task has to earn — real ambiguity,
+a design call, an unfamiliar subsystem — never the default it falls back to.
 
-| Primary | Delegates to | Does itself |
-| --- | --- | --- |
-| **Fable** | Opus or Sonnet | Planning and orchestration only — no implementation |
-| **Opus** | Sonnet or Haiku | Plans, then implements only what genuinely needs its judgement |
-| **Sonnet** | Haiku | Implementation |
+- **Fable** plans and orchestrates, and does **not** implement. Per task it picks between its two workers: **Sonnet**
+  for anything the plan fully specifies, **Opus** only where the task still needs judgement mid-flight.
+- **Opus** plans, then implements the parts that need its own judgement; per task it picks between **Sonnet** for
+  specified work and **Haiku** for the mechanical passes — a rename across a package, a sweep for one pattern, a
+  fixture updated in ten files.
+- **Sonnet** implements.
 
-**Pick the cheapest worker that will do the job well — never default to the most capable one.** Choosing the
-strongest model available for every task wastes the budget that makes delegation worth doing, and it is the
-primary's job to make that call, task by task, on how much judgement the work actually needs.
-
-Unfamiliar design, subtle concurrency, `unsafe` whose soundness argument is not obvious, and anything where
-being wrong is expensive and quiet — kernel bring-up, page tables, capability logic — go to the stronger
-worker. Mechanical refactors, moving code between modules, writing tests against a settled contract,
-boilerplate and repetitive edits with a clear specification go to the cheaper one. When a cheap worker
-returns something wrong, escalate that task rather than lowering the bar for the next one.
+A delegated task carries what the delegate cannot infer: the file, the rule it must not break, and how the result is
+verified. Delegation is not a way to avoid reading the code — whoever plans still has to know what they are asking for.
 
 # Before making a commit or providing a suggestion
 
